@@ -34,7 +34,7 @@ const STATUS_OPTIONS: {
 }[] = [
   { value: "AVAILABLE", label: "Available", color: "#22C55E" },
   { value: "BUSY", label: "Busy", color: "#F59E0B" },
-  { value: "OFFLINE", label: "Offline", color: "#9CA3AF" },
+  { value: "OFFLINE", label: "Offline", color: "#EF4444" },
 ];
 
 /**
