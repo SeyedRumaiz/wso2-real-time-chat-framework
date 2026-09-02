@@ -370,10 +370,17 @@ func (h *ChatHandler) HandleCustomerMessage(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, ErrMsgInternal)
 		return
 	}
+	// Best-effort: this is an internal, service-to-service call from
+	// backend-v2 with no customer browser session behind it, so there is no
+	// x-user-id-token to give entity-service — and entity's CreateCaseComment
+	// (unlike CreateCase) has no way to accept a pre-supplied author for a
+	// trusted internal caller, so this write is expected to 401 there today.
+	// That must not block the live relay below: the customer is mid-chat
+	// with an engineer right now, and losing the case's audit-trail comment
+	// is far less costly than silently dropping their message entirely
+	// (which returning early here used to do).
 	if _, err := h.entity.CreateCaseComment(r.Context(), req.CaseID, commentBody); err != nil {
-		slog.ErrorContext(r.Context(), "entity CreateCaseComment failed for customer chat message", "caseID", req.CaseID, "err", err)
-		mapUpstreamErrorGeneric(w, err, "Failed to relay message to the engineer.")
-		return
+		slog.WarnContext(r.Context(), "entity CreateCaseComment failed for customer chat message (non-blocking)", "caseID", req.CaseID, "err", err)
 	}
 
 	h.publishToEngineers(chatEvent{

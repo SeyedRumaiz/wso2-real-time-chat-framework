@@ -194,15 +194,26 @@ func (r *caseRepo) GetCaseByID(ctx context.Context, id string) (domain.CaseView,
 
 // CreateCaseComment implements CaseRepository.
 func (r *caseRepo) CreateCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CaseComment, error) {
+	// CaseComment.CreatedBy is a CommentUserRef (id/firstName/lastName/fullName),
+	// not the raw created_by UUID column, so the insert is wrapped in a CTE and
+	// joined against users to resolve those fields in the same round trip —
+	// scanning the bare created_by column directly into a CommentUserRef would
+	// fail (mismatched shape), which is exactly what this used to do.
 	const query = `
-		INSERT INTO case_comments (case_id, type, content, created_by)
-		VALUES ($1, $2::comment_type_enum, $3, $4)
-		RETURNING id, case_id, type, content, created_by, created_at`
+		WITH inserted AS (
+			INSERT INTO case_comments (case_id, type, content, created_by)
+			VALUES ($1, $2::comment_type_enum, $3, $4)
+			RETURNING id, case_id, type, content, created_by, created_at
+		)
+		SELECT i.id, i.case_id, i.type, i.content, u.id, u.first_name, u.last_name, i.created_at
+		FROM inserted i
+		JOIN users u ON u.id = i.created_by`
 
 	var c domain.CaseComment
+	var firstName, lastName string
 	err := r.db.QueryRow(ctx, query,
 		req.CaseID, string(req.Type), req.Content, req.CreatedBy,
-	).Scan(&c.ID, &c.CaseID, &c.Type, &c.Content, &c.CreatedBy, &c.CreatedOn)
+	).Scan(&c.ID, &c.CaseID, &c.Type, &c.Content, &c.CreatedBy.ID, &firstName, &lastName, &c.CreatedOn)
 	if err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
 			switch pgErr.Code {
@@ -214,6 +225,9 @@ func (r *caseRepo) CreateCaseComment(ctx context.Context, req domain.CreateCaseC
 		}
 		return domain.CaseComment{}, fmt.Errorf("create case comment: %w", err)
 	}
+	c.CreatedBy.FirstName = firstName
+	c.CreatedBy.LastName = lastName
+	c.CreatedBy.FullName = strings.TrimSpace(firstName + " " + lastName)
 	return c, nil
 }
 
