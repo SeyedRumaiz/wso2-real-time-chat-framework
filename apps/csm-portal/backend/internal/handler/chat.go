@@ -433,10 +433,17 @@ func (h *ChatHandler) HandleAcceptSession(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, ErrMsgInternal)
 		return
 	}
+	// Best-effort: entity-service's Postgres-backed cases table has no
+	// assignee column today — UpdateCase unconditionally rejects
+	// assigneeEmail with 400, regardless of the case's actual data source
+	// (see case_service.go's UpdateCase). Every case created via the chat-
+	// escalation path is a Postgres case, so this call is expected to fail
+	// there. The routing service already reserved this engineer's capacity
+	// at assignment time (see HandleEscalate/HandleSetPresence), so a
+	// failure here must not block accepting — it only means the case row
+	// itself won't reflect who picked it up.
 	if _, err := h.entity.PatchCase(r.Context(), caseID, patchBody); err != nil {
-		slog.ErrorContext(r.Context(), "entity PatchCase failed accepting chat session", "userID", user.UserID, "caseID", caseID, "err", err)
-		mapUpstreamError(w, err, "Failed to accept the chat session.")
-		return
+		slog.WarnContext(r.Context(), "entity PatchCase failed accepting chat session (non-blocking)", "userID", user.UserID, "caseID", caseID, "err", err)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)

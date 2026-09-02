@@ -166,7 +166,10 @@ export default function NoveraChatPage(): JSX.Element {
   // state. Cleared on engineer_disconnected.
   const escalationCaseIdRef = useRef<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(
-    () => urlConversationId ?? conversationResponse?.conversationId ?? null,
+    () =>
+      urlConversationId ??
+      conversationResponse?.conversationId ??
+      crypto.randomUUID(),
   );
   // Resolver for a pending "wait for the conversation id" promise (see
   // waitForConversationId). Resolved when conversation_created arrives, so a
@@ -299,19 +302,18 @@ export default function NoveraChatPage(): JSX.Element {
   }, [urlConversationId, conversationHistory, queryClient, currentUserEmail]);
 
 
-  // Update URL with conversationId from describe-issue flow
+  // Update the URL with conversationId once one exists -- either from the
+  // describe-issue flow's conversationResponse, or the id this page mints
+  // itself for a brand-new chat (see the conversationId initializer above).
+  // Keeps a reload or a shared link resuming the same conversation instead
+  // of minting a fresh id every time.
   useEffect(() => {
-    if (
-      !urlConversationId &&
-      conversationResponse?.conversationId &&
-      projectId
-    ) {
-      navigate(
-        `/projects/${projectId}/support/chat/${conversationResponse.conversationId}`,
-        { replace: true },
-      );
+    if (!urlConversationId && conversationId && projectId) {
+      navigate(`/projects/${projectId}/support/chat/${conversationId}`, {
+        replace: true,
+      });
     }
-  }, [urlConversationId, conversationResponse, projectId, navigate]);
+  }, [urlConversationId, conversationId, projectId, navigate]);
 
   // Wait (bounded) for the conversation id, which arrives asynchronously over
   // the chat WebSocket. Resolves immediately if it's already known; otherwise

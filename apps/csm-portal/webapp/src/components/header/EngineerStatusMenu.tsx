@@ -73,6 +73,13 @@ export default function EngineerStatusMenu(): JSX.Element {
         disableUnderline
         aria-label="Set your engineer status"
         disabled={setStatus.isPending}
+        // Without this, MUI renders the matching MenuItem's children (its
+        // own colored dot + label) as the closed-state display *in addition
+        // to* the startAdornment dot below -- two dots for one status.
+        // renderValue takes over the closed-state display entirely, so only
+        // the startAdornment's dot shows once collapsed; each MenuItem's own
+        // dot still renders normally in the open dropdown list.
+        renderValue={() => currentOption.label}
         startAdornment={
           <Box
             component="span"

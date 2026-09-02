@@ -7,7 +7,8 @@ BEGIN;
 INSERT INTO users (id, user_name, first_name, last_name, email, phone, timezone, user_type)
 VALUES 
   ('10000000-0000-0000-0000-000000000001', 'john.doe2', 'John', 'Doe', 'john.doe2@example.com', '+1234567890', 'UTC', 'customer'),
-  ('20000000-0000-0000-0000-000000000002', 'csm.engineer2', 'Alice', 'Smith', 'alice.smith2@wso2.com', '+1987654321', 'UTC', 'internal')
+  ('20000000-0000-0000-0000-000000000002', 'csm.engineer2', 'Alice', 'Smith', 'alice.smith2@wso2.com', '+1987654321', 'UTC', 'internal'),
+  ('7726d9ec-b9b8-41ed-a662-60c288785e98', 'rumaiz', 'Rumaiz', 'WSO2', 'rumaiz@wso2.com', NULL, 'UTC', 'customer')
 ON CONFLICT (id) DO NOTHING;
 
 -- ============================================================================
