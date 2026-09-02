@@ -32,7 +32,7 @@ import {
 // item; see SELECTABLE_STATUSES below.
 const STATUS_DISPLAY: Record<EngineerStatus, { label: string; color: string }> = {
   AVAILABLE: { label: "Available", color: "#22C55E" },
-  BUSY: { label: "Busy", color: "#F59E0B" },
+  BUSY: { label: "Busy", color: "#EAB308" },
   OFFLINE: { label: "Offline", color: "#EF4444" },
 };
 
