@@ -624,9 +624,15 @@ func (h *ChatHandler) HandleSetPresence(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
 		return
 	}
+	// BUSY is intentionally excluded: it's a derived state the routing
+	// service sets automatically when a case is assigned (see
+	// router.Router.SetPresence/Escalate), never something an engineer
+	// requests directly. The CSM portal's status dropdown doesn't offer it
+	// either (see EngineerStatusMenu.tsx) — this is the defense-in-depth
+	// backstop for any other caller of this endpoint.
 	status := routingclient.Status(req.Status)
 	switch status {
-	case routingclient.StatusAvailable, routingclient.StatusBusy, routingclient.StatusOffline:
+	case routingclient.StatusAvailable, routingclient.StatusOffline:
 		// valid
 	default:
 		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)

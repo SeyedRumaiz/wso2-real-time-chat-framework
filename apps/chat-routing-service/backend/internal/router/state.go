@@ -148,9 +148,12 @@ type PresenceResult struct {
 // Idle: AVAILABLE joins the pool (available_since = now()) and, if the
 // queue is non-empty, immediately pops and assigns the head (the engineer
 // goes straight to BUSY with that case, still counted as "applied" rather
-// than a separate step the caller has to notice). BUSY is a manual "do not
-// disturb" -- leaves/stays out of the pool with no case. OFFLINE also
-// leaves/stays out of the pool.
+// than a separate step the caller has to notice). OFFLINE leaves/stays out
+// of the pool. BUSY is not a valid direct request at all -- it's a derived
+// state this method only ever produces as a side effect of the AVAILABLE
+// queue-drain above, never something a caller asks for; a request for it
+// here is a no-op (Applied: false), the same as any other unrecognized
+// status.
 func (r *Router) SetPresence(ctx context.Context, email, engineerID string, want Status) (PresenceResult, error) {
 	var result PresenceResult
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
@@ -200,18 +203,6 @@ func (r *Router) SetPresence(ctx context.Context, email, engineerID string, want
 			}
 			assigned := c
 			result = PresenceResult{Applied: true, AssignedCase: &assigned}
-			return nil
-
-		case StatusBusy:
-			if _, err := tx.Exec(ctx, `
-				UPDATE engineers
-				SET status = 'BUSY', pending_offline = false,
-				    available_since = NULL, updated_at = now()
-				WHERE email = $1
-			`, email); err != nil {
-				return fmt.Errorf("set busy: %w", err)
-			}
-			result = PresenceResult{Applied: true}
 			return nil
 
 		case StatusOffline:

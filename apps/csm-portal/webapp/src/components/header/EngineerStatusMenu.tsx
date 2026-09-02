@@ -27,14 +27,23 @@ import {
   type EngineerStatus,
 } from "@features/csm-chat/api/useEngineerStatus";
 
-const STATUS_OPTIONS: {
-  value: EngineerStatus;
-  label: string;
-  color: string;
-}[] = [
-  { value: "AVAILABLE", label: "Available", color: "#22C55E" },
-  { value: "BUSY", label: "Busy", color: "#F59E0B" },
-  { value: "OFFLINE", label: "Offline", color: "#EF4444" },
+// Display info for every status, including BUSY — which is shown (as the
+// current value, with its own color) but is never itself a clickable menu
+// item; see SELECTABLE_STATUSES below.
+const STATUS_DISPLAY: Record<EngineerStatus, { label: string; color: string }> = {
+  AVAILABLE: { label: "Available", color: "#22C55E" },
+  BUSY: { label: "Busy", color: "#F59E0B" },
+  OFFLINE: { label: "Offline", color: "#EF4444" },
+};
+
+// The only two states an engineer can ever request directly. BUSY is purely
+// derived — the routing service sets it automatically the moment a case is
+// assigned (see chat-routing-service's Router.SetPresence/Escalate), and a
+// direct request for it is now rejected server-side, so it's never offered
+// here either.
+const SELECTABLE_STATUSES: { value: EngineerStatus; label: string; color: string }[] = [
+  { value: "AVAILABLE", ...STATUS_DISPLAY.AVAILABLE },
+  { value: "OFFLINE", ...STATUS_DISPLAY.OFFLINE },
 ];
 
 /**
@@ -48,14 +57,22 @@ const STATUS_OPTIONS: {
  * Defaults to Offline — the routing service's own default for an engineer
  * it has never seen a presence update from — while the initial fetch is in
  * flight, so the dropdown never flashes an incorrect Available state.
+ *
+ * While BUSY (an active, accepted chat session), "Available" is shown but
+ * disabled — you can't manually leave a session early, capacity is one
+ * dedicated case at a time. "Offline" stays enabled: picking it while BUSY
+ * doesn't end the session, it just confirms the engineer will go offline
+ * once the current chat completes (pendingOffline). If they never touch
+ * it, ending the session returns them straight to AVAILABLE and back into
+ * the pool.
  */
 export default function EngineerStatusMenu(): JSX.Element {
   const { data: status } = useGetEngineerStatus();
   const setStatus = useSetEngineerStatus();
 
   const current: EngineerStatus = status ?? "OFFLINE";
-  const currentOption =
-    STATUS_OPTIONS.find((o) => o.value === current) ?? STATUS_OPTIONS[2];
+  const currentOption = STATUS_DISPLAY[current];
+  const isBusy = current === "BUSY";
 
   const handleChange = (e: SelectChangeEvent<string>): void => {
     const next = e.target.value as EngineerStatus;
@@ -104,8 +121,40 @@ export default function EngineerStatusMenu(): JSX.Element {
           },
         }}
       >
-        {STATUS_OPTIONS.map((o) => (
-          <MenuItem key={o.value} value={o.value} sx={{ fontSize: "0.8125rem" }}>
+        {
+          // MUI logs an "out-of-range value" warning if the Select's value
+          // doesn't match any rendered MenuItem. BUSY is never a choice,
+          // but it can be the *current* value, so it gets a disabled item
+          // of its own only while it's actually current -- present so the
+          // value always matches something, but never clickable.
+          isBusy && (
+            <MenuItem value="BUSY" disabled sx={{ fontSize: "0.8125rem" }}>
+              <Box
+                component="span"
+                sx={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: "50%",
+                  bgcolor: STATUS_DISPLAY.BUSY.color,
+                  display: "inline-block",
+                  mr: 1,
+                }}
+              />
+              {STATUS_DISPLAY.BUSY.label}
+            </MenuItem>
+          )
+        }
+        {SELECTABLE_STATUSES.map((o) => (
+          <MenuItem
+            key={o.value}
+            value={o.value}
+            // Can't manually go back to Available mid-session -- capacity
+            // is one dedicated case at a time. Offline stays enabled: it
+            // doesn't end the session, it just sets pendingOffline (see
+            // this component's doc comment).
+            disabled={isBusy && o.value === "AVAILABLE"}
+            sx={{ fontSize: "0.8125rem" }}
+          >
             <Box
               component="span"
               sx={{
