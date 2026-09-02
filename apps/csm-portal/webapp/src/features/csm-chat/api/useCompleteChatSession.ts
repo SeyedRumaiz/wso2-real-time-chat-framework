@@ -14,8 +14,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { useMutation, type UseMutationResult } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueryClient,
+  type UseMutationResult,
+} from "@tanstack/react-query";
 import { useBackendApi } from "@api/backend/client";
+import { ENGINEER_STATUS_QUERY_KEY } from "./useEngineerStatus";
 
 export interface CompleteChatSessionInput {
   caseId: string;
@@ -29,6 +34,13 @@ export interface CompleteChatSessionInput {
  * back to Novera-only chat. Deliberately does not change the case's own
  * state — resolving the underlying issue is still a separate, explicit step
  * on the normal case detail page.
+ *
+ * This also releases the engineer's routing-service capacity server-side
+ * (back to AVAILABLE, or OFFLINE if they'd set pendingOffline) — but the
+ * response here doesn't say which, so the status dropdown's own query is
+ * invalidated rather than optimistically set, letting it refetch the real
+ * outcome instead of going stale showing BUSY forever (a session only
+ * reaches this call once already accepted, i.e. BUSY, not PENDING).
  */
 export function useCompleteChatSession(): UseMutationResult<
   { message: string },
@@ -36,11 +48,15 @@ export function useCompleteChatSession(): UseMutationResult<
   CompleteChatSessionInput
 > {
   const api = useBackendApi();
+  const queryClient = useQueryClient();
 
   return useMutation<{ message: string }, Error, CompleteChatSessionInput>({
     mutationFn: ({ caseId, conversationId }) =>
       api.post(`/chat/sessions/${encodeURIComponent(caseId)}/complete`, {
         conversationId,
       }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ENGINEER_STATUS_QUERY_KEY });
+    },
   });
 }

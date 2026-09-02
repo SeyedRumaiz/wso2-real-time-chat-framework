@@ -89,8 +89,12 @@ type Status string
 
 const (
 	StatusAvailable Status = "AVAILABLE"
-	StatusBusy      Status = "BUSY"
-	StatusOffline   Status = "OFFLINE"
+	// StatusPending is an engineer assigned a case but who has not yet
+	// clicked Accept -- see chat-routing-service's router.StatusPending
+	// and router.Router.Accept.
+	StatusPending Status = "PENDING"
+	StatusBusy    Status = "BUSY"
+	StatusOffline Status = "OFFLINE"
 )
 
 // CaseInfo mirrors router.CaseInfo — the case fields carried through an
@@ -136,6 +140,11 @@ type DeclineResult struct {
 	// handed to that other engineer, in the same shape HandleEscalate would
 	// have delivered it in originally.
 	AssignedCase *CaseInfo `json:"assignedCase,omitempty"`
+}
+
+// AcceptResult mirrors router.AcceptResult.
+type AcceptResult struct {
+	Applied bool `json:"applied"`
 }
 
 // do is the shared request/response plumbing for every method below: encode
@@ -231,13 +240,41 @@ func (c *Client) Decline(ctx context.Context, email, caseID string) (DeclineResu
 	return out, err
 }
 
+// Accept calls POST /route/accept, confirming email is accepting the case
+// (caseID) they were assigned -- flips PENDING to BUSY server-side. See
+// router.Router.Accept's own doc comment for when Applied comes back
+// false (a stale accept) rather than an error.
+func (c *Client) Accept(ctx context.Context, email, caseID string) (AcceptResult, error) {
+	var out AcceptResult
+	body := struct {
+		Email  string `json:"email"`
+		CaseID string `json:"caseId"`
+	}{Email: email, CaseID: caseID}
+	err := c.do(ctx, http.MethodPost, "/route/accept", body, &out)
+	return out, err
+}
+
+// PresenceDetail is GetPresence's result -- status plus, when PENDING or
+// BUSY, the case the engineer is currently on (nil otherwise). CurrentCase
+// exists so a caller can rehydrate an active alert or session's UI state
+// after it's been lost client-side (a refresh, a closed tab) even though
+// the engineer is still genuinely holding it server-side.
+type PresenceDetail struct {
+	Status      Status    `json:"status"`
+	CurrentCase *CaseInfo `json:"currentCase,omitempty"`
+}
+
 // GetPresence calls GET /route/presence/{email}, returning StatusOffline
-// for an engineer the routing service has never seen a presence update
-// from (see router.Router.GetPresence).
-func (c *Client) GetPresence(ctx context.Context, email string) (Status, error) {
-	var out struct {
-		Status Status `json:"status"`
-	}
+// (and no case) for an engineer the routing service has never seen a
+// presence update from (see router.Router.GetPresence).
+func (c *Client) GetPresence(ctx context.Context, email string) (PresenceDetail, error) {
+	var out PresenceDetail
 	err := c.do(ctx, http.MethodGet, "/route/presence/"+url.PathEscape(email), nil, &out)
-	return out.Status, err
+	if err != nil {
+		return PresenceDetail{}, err
+	}
+	if out.Status == "" {
+		out.Status = StatusOffline
+	}
+	return out, nil
 }

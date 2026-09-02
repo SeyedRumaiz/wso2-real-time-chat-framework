@@ -16,7 +16,8 @@
 
 // Package router implements the engineer-availability/queue state machine
 // for the live-engineer-chat routing feature: engineers are AVAILABLE,
-// BUSY, or OFFLINE. An escalation is assigned by priority -- first to the
+// PENDING (assigned, not yet accepted), BUSY (accepted, in-progress), or
+// OFFLINE. An escalation is assigned by priority -- first to the
 // engineer that customer was most recently assigned to, if that engineer
 // is free right now, otherwise to whichever AVAILABLE engineer has taken
 // the fewest chats today (ties broken by who's been AVAILABLE longest) --
@@ -40,8 +41,18 @@ type Status string
 
 const (
 	StatusAvailable Status = "AVAILABLE"
-	StatusBusy      Status = "BUSY"
-	StatusOffline   Status = "OFFLINE"
+	// StatusPending is an engineer who has just been assigned a case
+	// (Escalate, SetPresence's queue-drain, or Decline's reassignment) but
+	// has not yet clicked Accept -- their capacity is already reserved
+	// (current_case_id is set, exactly like BUSY) so they're skipped by
+	// every "find an available engineer" query, but the CSM portal's
+	// status bar shows this distinctly from Busy until Router.Accept
+	// confirms it.
+	StatusPending Status = "PENDING"
+	// StatusBusy is an engineer with an accepted, in-progress session --
+	// only ever reached via Router.Accept from StatusPending.
+	StatusBusy    Status = "BUSY"
+	StatusOffline Status = "OFFLINE"
 )
 
 // CaseInfo is everything csm-portal/backend needs to reconstruct the

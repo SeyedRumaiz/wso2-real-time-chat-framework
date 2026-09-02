@@ -14,8 +14,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { useMutation, type UseMutationResult } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueryClient,
+  type UseMutationResult,
+} from "@tanstack/react-query";
 import { useBackendApi } from "@api/backend/client";
+import { ENGINEER_STATUS_QUERY_KEY } from "./useEngineerStatus";
 
 export interface DeclineChatSessionInput {
   caseId: string;
@@ -32,6 +37,13 @@ export interface DeclineChatSessionInput {
  * strand the customer with nobody else ever seeing their request. The
  * backend re-routes the case to another available engineer, or requeues
  * it if none are free; this call does not need to know which happened.
+ *
+ * Declining releases the SAME routing-service capacity accepting would
+ * have (you're assigned, and therefore PENDING, the moment an escalation
+ * routes to you — before you've clicked anything, see router.Router.
+ * Accept for how PENDING later becomes BUSY) — so this also invalidates
+ * the status dropdown's query the same way completing a session does,
+ * rather than leaving it stuck showing PENDING.
  */
 export function useDeclineChatSession(): UseMutationResult<
   { message: string },
@@ -39,11 +51,15 @@ export function useDeclineChatSession(): UseMutationResult<
   DeclineChatSessionInput
 > {
   const api = useBackendApi();
+  const queryClient = useQueryClient();
 
   return useMutation<{ message: string }, Error, DeclineChatSessionInput>({
     mutationFn: ({ caseId, conversationId }) =>
       api.post(`/chat/sessions/${encodeURIComponent(caseId)}/decline`, {
         conversationId,
       }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ENGINEER_STATUS_QUERY_KEY });
+    },
   });
 }

@@ -147,13 +147,14 @@ type PresenceResult struct {
 //
 // Idle: AVAILABLE joins the pool (available_since = now()) and, if the
 // queue is non-empty, immediately pops and assigns the head (the engineer
-// goes straight to BUSY with that case, still counted as "applied" rather
-// than a separate step the caller has to notice). OFFLINE leaves/stays out
-// of the pool. BUSY is not a valid direct request at all -- it's a derived
-// state this method only ever produces as a side effect of the AVAILABLE
-// queue-drain above, never something a caller asks for; a request for it
-// here is a no-op (Applied: false), the same as any other unrecognized
-// status.
+// goes straight to PENDING with that case -- not yet Busy, see Accept --
+// still counted as "applied" rather than a separate step the caller has to
+// notice). OFFLINE leaves/stays out of the pool. Neither PENDING nor BUSY
+// is a valid direct request -- both are derived states this method only
+// ever produces as a side effect (PENDING via the AVAILABLE queue-drain
+// above, BUSY only via Accept), never something a caller asks for; a
+// request for either here is a no-op (Applied: false), the same as any
+// other unrecognized status.
 func (r *Router) SetPresence(ctx context.Context, email, engineerID string, want Status) (PresenceResult, error) {
 	var result PresenceResult
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
@@ -416,19 +417,101 @@ func (r *Router) Decline(ctx context.Context, email, caseID string) (DeclineResu
 	return result, nil
 }
 
-// GetPresence returns email's current status, defaulting to OFFLINE for an
-// engineer this database has never seen a presence update from.
-func (r *Router) GetPresence(ctx context.Context, email string) (Status, error) {
-	var status Status
-	err := r.db.QueryRow(ctx, `SELECT status FROM engineers WHERE email = $1`, email).Scan(&status)
+// AcceptResult is Accept's outcome.
+type AcceptResult struct {
+	// Applied is true when email was PENDING on exactly caseID and has now
+	// been flipped to BUSY. False means the accept is stale -- the case
+	// was already declined/reassigned/requeued out from under this
+	// engineer (or they never held it at all) -- and the caller (csm-
+	// portal/backend's HandleAcceptSession) should surface a "this
+	// request is no longer available" response rather than proceeding.
+	Applied bool `json:"applied"`
+}
+
+// Accept confirms email is actually accepting the case they were assigned:
+// only flips PENDING -> BUSY (available_since stays NULL, current_case*
+// untouched -- this is a pure status change) when email's current_case_id
+// still equals caseID and their status is still PENDING. Any other state
+// -- OFFLINE/AVAILABLE (declined or reassigned already), already BUSY
+// (accept already applied, e.g. a duplicate click or a rehydrated retry),
+// or PENDING on a *different* case -- reports Applied: false rather than
+// erroring, since "the thing you tried to accept isn't there anymore" is
+// an expected race (a customer-side timeout, another path already
+// resolving it), not a server fault.
+func (r *Router) Accept(ctx context.Context, email, caseID string) (AcceptResult, error) {
+	var result AcceptResult
+	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		var (
+			status        Status
+			currentCaseID *string
+		)
+		err := tx.QueryRow(ctx, `
+			SELECT status, current_case_id FROM engineers WHERE email = $1 FOR UPDATE
+		`, email).Scan(&status, &currentCaseID)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			result = AcceptResult{}
+			return nil
+		case err != nil:
+			return fmt.Errorf("lock engineer: %w", err)
+		}
+		if status != StatusPending || currentCaseID == nil || *currentCaseID != caseID {
+			result = AcceptResult{}
+			return nil
+		}
+
+		if _, err := tx.Exec(ctx, `
+			UPDATE engineers SET status = 'BUSY', updated_at = now() WHERE email = $1
+		`, email); err != nil {
+			return fmt.Errorf("accept case: %w", err)
+		}
+		result = AcceptResult{Applied: true}
+		return nil
+	})
+	if err != nil {
+		return AcceptResult{}, err
+	}
+	return result, nil
+}
+
+// PresenceDetail is GetPresence's result: the status alone was enough for
+// the "initialize the dropdown correctly" use case it was built for, but a
+// PENDING or BUSY engineer's browser session can be lost independently of
+// this server-side state (a refresh, a closed tab) with nothing left in
+// the UI to act on it -- CurrentCase lets a caller rehydrate that lost
+// alert/session instead of leaving the engineer stuck with no way to
+// accept, decline, or end it.
+type PresenceDetail struct {
+	Status      Status
+	CurrentCase *CaseInfo
+}
+
+// GetPresence returns email's current status and, when PENDING or BUSY,
+// the case they are currently on (nil otherwise) -- defaulting to
+// OFFLINE/no case for an engineer this database has never seen a presence
+// update from.
+func (r *Router) GetPresence(ctx context.Context, email string) (PresenceDetail, error) {
+	var (
+		status      Status
+		currentCase []byte
+	)
+	err := r.db.QueryRow(ctx, `SELECT status, current_case FROM engineers WHERE email = $1`, email).
+		Scan(&status, &currentCase)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		return StatusOffline, nil
+		return PresenceDetail{Status: StatusOffline}, nil
 	case err != nil:
-		return "", fmt.Errorf("router: get presence: %w", err)
-	default:
-		return status, nil
+		return PresenceDetail{}, fmt.Errorf("router: get presence: %w", err)
 	}
+	detail := PresenceDetail{Status: status}
+	if currentCase != nil {
+		var c CaseInfo
+		if err := json.Unmarshal(currentCase, &c); err != nil {
+			return PresenceDetail{}, fmt.Errorf("router: get presence: decode current case: %w", err)
+		}
+		detail.CurrentCase = &c
+	}
+	return detail, nil
 }
 
 // DebugEngineer is one engineer's row in DebugState's dump.
@@ -705,17 +788,20 @@ func popAvailableEngineer(ctx context.Context, tx pgx.Tx, exclude string) (email
 	}
 }
 
-// assignCaseToEngineer marks email BUSY with c as their current case,
-// records the assignment in assignment_log (see migrations/000005 -- the
-// source popAvailableEngineer/debugEngineers/debugAvailable COUNT(*) over
-// to rank by "chats today" dynamically, rather than a stored counter), and,
-// when c.CustomerEmail is set, records this customer as now belonging to
-// email for the next time they escalate (see stickyEngineerFor /
+// assignCaseToEngineer marks email PENDING with c as their current case --
+// reserving their capacity immediately, exactly like the old BUSY-on-
+// assignment behavior, but not yet showing them as Busy until they
+// explicitly accept it (see Router.Accept) -- records the assignment in
+// assignment_log (see migrations/000005 -- the source
+// popAvailableEngineer/debugEngineers/debugAvailable COUNT(*) over to rank
+// by "chats today" dynamically, rather than a stored counter), and, when
+// c.CustomerEmail is set, records this customer as now belonging to email
+// for the next time they escalate (see stickyEngineerFor /
 // stickyOrLeastBusyEngineer).
 func assignCaseToEngineer(ctx context.Context, tx pgx.Tx, email string, c CaseInfo, caseInfoJSON []byte) error {
 	if _, err := tx.Exec(ctx, `
 		UPDATE engineers
-		SET status = 'BUSY', current_case_id = $1, current_case = $2::jsonb,
+		SET status = 'PENDING', current_case_id = $1, current_case = $2::jsonb,
 		    available_since = NULL, updated_at = now()
 		WHERE email = $3
 	`, c.CaseID, caseInfoJSON, email); err != nil {

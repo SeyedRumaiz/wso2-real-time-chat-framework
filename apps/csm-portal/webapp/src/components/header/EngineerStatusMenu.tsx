@@ -27,19 +27,25 @@ import {
   type EngineerStatus,
 } from "@features/csm-chat/api/useEngineerStatus";
 
-// Display info for every status, including BUSY — which is shown (as the
-// current value, with its own color) but is never itself a clickable menu
-// item; see SELECTABLE_STATUSES below.
+// Display info for every status, including PENDING and BUSY — both shown
+// (as the current value, with their own color) but never themselves a
+// clickable menu item; see SELECTABLE_STATUSES below. PENDING (a case was
+// just assigned, awaiting Accept) gets its own blue between Available's
+// green and Busy's yellow — a distinct color is the whole point of this
+// state existing, so the bar never claims "Busy" before the engineer has
+// actually accepted anything.
 const STATUS_DISPLAY: Record<EngineerStatus, { label: string; color: string }> = {
   AVAILABLE: { label: "Available", color: "#22C55E" },
+  PENDING: { label: "Pending", color: "#3B82F6" },
   BUSY: { label: "Busy", color: "#EAB308" },
   OFFLINE: { label: "Offline", color: "#EF4444" },
 };
 
-// The only two states an engineer can ever request directly. BUSY is purely
-// derived — the routing service sets it automatically the moment a case is
-// assigned (see chat-routing-service's Router.SetPresence/Escalate), and a
-// direct request for it is now rejected server-side, so it's never offered
+// The only two states an engineer can ever request directly. PENDING and
+// BUSY are purely derived — the routing service sets PENDING the moment a
+// case is assigned and BUSY only once the engineer accepts it (see
+// chat-routing-service's Router.SetPresence/Escalate/Accept), and a direct
+// request for either is now rejected server-side, so neither is offered
 // here either.
 const SELECTABLE_STATUSES: { value: EngineerStatus; label: string; color: string }[] = [
   { value: "AVAILABLE", ...STATUS_DISPLAY.AVAILABLE },
@@ -58,20 +64,22 @@ const SELECTABLE_STATUSES: { value: EngineerStatus; label: string; color: string
  * it has never seen a presence update from — while the initial fetch is in
  * flight, so the dropdown never flashes an incorrect Available state.
  *
- * While BUSY (an active, accepted chat session), "Available" is shown but
- * disabled — you can't manually leave a session early, capacity is one
- * dedicated case at a time. "Offline" stays enabled: picking it while BUSY
- * doesn't end the session, it just confirms the engineer will go offline
- * once the current chat completes (pendingOffline). If they never touch
- * it, ending the session returns them straight to AVAILABLE and back into
- * the pool.
+ * While PENDING (a case was just assigned, awaiting Accept) or BUSY (an
+ * active, accepted chat session), "Available" is shown but disabled — you
+ * can't manually jump back to available while a case is reserved for you,
+ * capacity is one dedicated case at a time. "Offline" stays enabled:
+ * picking it doesn't decline/end anything itself, it just confirms the
+ * engineer will go offline once the current pending request or chat
+ * completes (pendingOffline). If they never touch it, ending the session
+ * returns them straight to AVAILABLE and back into the pool.
  */
 export default function EngineerStatusMenu(): JSX.Element {
-  const { data: status } = useGetEngineerStatus();
+  const { data: presence } = useGetEngineerStatus();
   const setStatus = useSetEngineerStatus();
 
-  const current: EngineerStatus = status ?? "OFFLINE";
+  const current: EngineerStatus = presence?.status ?? "OFFLINE";
   const currentOption = STATUS_DISPLAY[current];
+  const isPending = current === "PENDING";
   const isBusy = current === "BUSY";
 
   const handleChange = (e: SelectChangeEvent<string>): void => {
@@ -123,10 +131,29 @@ export default function EngineerStatusMenu(): JSX.Element {
       >
         {
           // MUI logs an "out-of-range value" warning if the Select's value
-          // doesn't match any rendered MenuItem. BUSY is never a choice,
-          // but it can be the *current* value, so it gets a disabled item
-          // of its own only while it's actually current -- present so the
-          // value always matches something, but never clickable.
+          // doesn't match any rendered MenuItem. Neither PENDING nor BUSY
+          // is ever a choice, but either can be the *current* value, so
+          // each gets a disabled item of its own only while it's actually
+          // current -- present so the value always matches something, but
+          // never clickable.
+          isPending && (
+            <MenuItem value="PENDING" disabled sx={{ fontSize: "0.8125rem" }}>
+              <Box
+                component="span"
+                sx={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: "50%",
+                  bgcolor: STATUS_DISPLAY.PENDING.color,
+                  display: "inline-block",
+                  mr: 1,
+                }}
+              />
+              {STATUS_DISPLAY.PENDING.label}
+            </MenuItem>
+          )
+        }
+        {
           isBusy && (
             <MenuItem value="BUSY" disabled sx={{ fontSize: "0.8125rem" }}>
               <Box
@@ -148,11 +175,12 @@ export default function EngineerStatusMenu(): JSX.Element {
           <MenuItem
             key={o.value}
             value={o.value}
-            // Can't manually go back to Available mid-session -- capacity
-            // is one dedicated case at a time. Offline stays enabled: it
-            // doesn't end the session, it just sets pendingOffline (see
-            // this component's doc comment).
-            disabled={isBusy && o.value === "AVAILABLE"}
+            // Can't manually go back to Available while a case is
+            // reserved (pending or in-progress) -- capacity is one
+            // dedicated case at a time. Offline stays enabled: it doesn't
+            // decline/end anything itself, it just sets pendingOffline
+            // (see this component's doc comment).
+            disabled={(isPending || isBusy) && o.value === "AVAILABLE"}
             sx={{ fontSize: "0.8125rem" }}
           >
             <Box

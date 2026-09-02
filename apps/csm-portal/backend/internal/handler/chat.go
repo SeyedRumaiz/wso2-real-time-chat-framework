@@ -123,7 +123,8 @@ type routingService interface {
 	SetPresence(ctx context.Context, email, engineerID string, status routingclient.Status) (routingclient.PresenceResult, error)
 	Completed(ctx context.Context, email string) (routingclient.CompletedResult, error)
 	Decline(ctx context.Context, email, caseID string) (routingclient.DeclineResult, error)
-	GetPresence(ctx context.Context, email string) (routingclient.Status, error)
+	Accept(ctx context.Context, email, caseID string) (routingclient.AcceptResult, error)
+	GetPresence(ctx context.Context, email string) (routingclient.PresenceDetail, error)
 }
 
 // ChatHandler implements the live-engineer-chat escalation endpoints.
@@ -404,14 +405,17 @@ type sessionActionRequest struct {
 
 // HandleAcceptSession handles POST /chat/sessions/{id}/accept —
 // browser-facing, behind the normal Auth middleware. {id} is the case ID.
-// Assigns the case to the authenticated engineer via the same PATCH
+// First confirms the accept with the routing service (PENDING -> BUSY —
+// see internal/routingclient.Client.Accept / chat-routing-service's
+// router.Router.Accept) — unlike the rest of this method, that call is
+// real and error-surfacing, not best-effort: this is the one moment the
+// engineer actually needs to know whether the case is still theirs to
+// take, since the alert could have been declined, reassigned, or already
+// accepted elsewhere in the meantime. Only once that succeeds does it
+// assign the case to the authenticated engineer via the same PATCH
 // /cases/{id} + assigneeEmail path csm-portal's case detail page already
 // uses (see cases.go's PatchCase / entity's assigneeEmail field) — there is
 // no separate "chat session" record; the case IS the session's record.
-// Unchanged by the routing-service work: the routing service already
-// reserved this engineer's capacity at assignment time (see HandleEscalate/
-// HandleSetPresence/HandleCompleteSession), so accepting stays a plain
-// entity-service PATCH with no routing call of its own.
 func (h *ChatHandler) HandleAcceptSession(w http.ResponseWriter, r *http.Request) {
 	user := middleware.UserInfoFromContext(r.Context())
 	if user == nil {
@@ -432,6 +436,17 @@ func (h *ChatHandler) HandleAcceptSession(w http.ResponseWriter, r *http.Request
 	var req sessionActionRequest
 	if err := json.Unmarshal(body, &req); err != nil || req.ConversationID == "" {
 		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+		return
+	}
+
+	acceptResult, err := h.routing.Accept(r.Context(), user.Email, caseID)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "chat: routing service accept failed", "userID", user.UserID, "caseID", caseID, "err", err)
+		writeError(w, http.StatusBadGateway, "Failed to accept the chat session. Please try again.")
+		return
+	}
+	if !acceptResult.Applied {
+		writeError(w, http.StatusConflict, "This chat request is no longer available.")
 		return
 	}
 
@@ -658,7 +673,10 @@ func (h *ChatHandler) HandleSetPresence(w http.ResponseWriter, r *http.Request) 
 // instead of assuming a default itself — the routing service's own default
 // for an engineer it has never seen (OFFLINE — see router.Router.
 // GetPresence) is exposed here rather than hardcoded a second time in the
-// browser.
+// browser. Also passes through currentCase when PENDING or BUSY, so the
+// browser can rehydrate a lost pending alert or active session's local
+// widget state after losing it (a refresh, a closed tab) instead of the
+// engineer being stuck with nothing in the UI to act on.
 func (h *ChatHandler) HandleGetPresence(w http.ResponseWriter, r *http.Request) {
 	user := middleware.UserInfoFromContext(r.Context())
 	if user == nil {
@@ -666,14 +684,14 @@ func (h *ChatHandler) HandleGetPresence(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	status, err := h.routing.GetPresence(r.Context(), user.Email)
+	detail, err := h.routing.GetPresence(r.Context(), user.Email)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "chat: routing service get presence failed", "userID", user.UserID, "err", err)
 		writeError(w, http.StatusBadGateway, "Failed to load your status. Please try again.")
 		return
 	}
 
-	writeJSONValue(w, http.StatusOK, map[string]routingclient.Status{"status": status})
+	writeJSONValue(w, http.StatusOK, detail)
 }
 
 // declineSessionRequest is the body an engineer's browser sends for

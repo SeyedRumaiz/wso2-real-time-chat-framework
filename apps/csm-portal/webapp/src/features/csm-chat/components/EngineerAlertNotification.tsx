@@ -24,13 +24,19 @@ import {
   TextField,
   Typography,
 } from "@wso2/oxygen-ui";
-import { useCallback, useState, type JSX, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useState, type JSX, type KeyboardEvent } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { BackendApiError } from "@api/backend/client";
 import { useIdTokenClaims } from "@hooks/useIdTokenClaims";
 import { useChatAlertsStream } from "@features/csm-chat/api/useChatAlertsStream";
 import { useAcceptChatSession } from "@features/csm-chat/api/useAcceptChatSession";
 import { useSendChatMessage } from "@features/csm-chat/api/useSendChatMessage";
 import { useCompleteChatSession } from "@features/csm-chat/api/useCompleteChatSession";
 import { useDeclineChatSession } from "@features/csm-chat/api/useDeclineChatSession";
+import {
+  ENGINEER_STATUS_QUERY_KEY,
+  useGetEngineerStatus,
+} from "@features/csm-chat/api/useEngineerStatus";
 import type { ChatAlertEvent } from "@features/csm-chat/types/chatAlerts";
 
 type PendingAlert = {
@@ -85,6 +91,45 @@ export default function EngineerAlertNotification(): JSX.Element | null {
   const sendMutation = useSendChatMessage();
   const completeMutation = useCompleteChatSession();
   const declineMutation = useDeclineChatSession();
+  const queryClient = useQueryClient();
+  const { data: presence } = useGetEngineerStatus();
+
+  // Rehydrates a lost alert/session after a refresh or a remount of this
+  // component (it's mounted once in AuthGuard, but a full page reload
+  // still wipes pending/session, which live only in this component's own
+  // state — see the doc comment on this whole component). GetPresence's
+  // status now distinguishes PENDING (assigned, not yet accepted) from
+  // BUSY (already accepted, chat in progress) — see chat-routing-service's
+  // router.Router.Accept — so this rehydrates straight into the matching
+  // local state instead of always guessing "pending" the way it had to
+  // before that distinction existed: PENDING becomes a pending alert
+  // (Accept/Decline still to come), BUSY goes directly into an active
+  // session with an empty message history (any messages exchanged before
+  // the reload are still in the case's comment history server-side, just
+  // not replayed into this local transcript). Either way, this is what
+  // gets an engineer un-stuck who is genuinely still PENDING/BUSY
+  // server-side with nothing left in the UI to act on.
+  useEffect(() => {
+    if (pending || session || !presence?.currentCase) return;
+    const cc = presence.currentCase;
+    if (presence.status === "BUSY") {
+      setSession({
+        caseId: cc.caseId,
+        conversationId: cc.conversationId,
+        customerName: cc.customerName,
+        messages: [],
+      });
+      return;
+    }
+    setPending({
+      caseId: cc.caseId,
+      conversationId: cc.conversationId,
+      subject: cc.subject,
+      customerEmail: cc.customerEmail,
+      customerName: cc.customerName,
+      message: cc.message,
+    });
+  }, [pending, session, presence]);
 
   const handleAlert = useCallback(
     (event: ChatAlertEvent) => {
@@ -94,6 +139,14 @@ export default function EngineerAlertNotification(): JSX.Element | null {
           // Ignore new escalations while already showing one, or while a
           // session is live — see this component's own doc comment.
           if (session) return;
+          // Receiving this event at all means the routing service just
+          // assigned this case to us — we're PENDING server-side from this
+          // instant, before Accept is even clicked (see router.Router.
+          // Accept, which is what later flips this to BUSY). The status
+          // dropdown's query has no way to know that on its own (nothing
+          // pushes to it), so invalidate it here rather than leaving it
+          // stuck showing whatever it was cached as (usually Available).
+          queryClient.invalidateQueries({ queryKey: ENGINEER_STATUS_QUERY_KEY });
           setPending((current) => {
             if (current) return current;
             return {
@@ -168,9 +221,18 @@ export default function EngineerAlertNotification(): JSX.Element | null {
       await acceptMutation.mutateAsync({ caseId, conversationId });
       setSession({ caseId, conversationId, customerName, messages: [] });
       setPending(null);
-    } catch {
-      // Leave the alert visible so the engineer can retry, or another
-      // engineer picks it up (their session_accepted clears it above).
+    } catch (err) {
+      // A 409 means the routing service's Accept check found this case
+      // isn't PENDING-for-this-engineer anymore (see HandleAcceptSession) —
+      // it was declined, reassigned, or already accepted elsewhere while
+      // this alert sat on screen. Nothing to retry there, so clear it
+      // rather than leaving a stuck "Accept" button that will only ever
+      // fail again. Any other failure (network blip, routing service
+      // briefly down) leaves the alert visible so the engineer can retry,
+      // or another engineer's session_accepted clears it above.
+      if (err instanceof BackendApiError && err.status === 409) {
+        setPending(null);
+      }
     }
   }, [pending, acceptMutation]);
 

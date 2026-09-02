@@ -9,11 +9,15 @@ per-customer sticky routing, and the waiting queue are persisted.
 Before this service existed, an escalation was broadcast to *every*
 connected engineer and "accepting" was first-`PATCH`-wins. This service
 replaces that with real state: engineers declare themselves
-`AVAILABLE` / `BUSY` / `OFFLINE`, an escalation is routed to exactly one
-engineer — preferring whoever that customer last talked to, then falling
-back to whoever's least busy today — and anyone who arrives while all
-engineers are busy waits in a FIFO queue that drains automatically as
-engineers free up.
+`AVAILABLE` / `OFFLINE` (`PENDING` and `BUSY` are derived, never a direct
+request — see below), an escalation is routed to exactly one engineer —
+preferring whoever that customer last talked to, then falling back to
+whoever's least busy today — and anyone who arrives while all engineers
+are busy waits in a FIFO queue that drains automatically as engineers free
+up. An assigned engineer shows `PENDING` (capacity reserved, alert not yet
+acted on) until they explicitly call `POST /route/accept`, only then
+becoming `BUSY` — the CSM portal's status bar never shows Busy before the
+engineer has actually accepted the case.
 
 ## Architecture
 
@@ -29,11 +33,11 @@ flowchart TB
     end
 
     subgraph CSM["csm-portal/backend :8083 — orchestrator"]
-        D["internal/handler/chat.go<br/>Escalate · SetPresence · Decline · CompleteSession<br/><br/>internal/handler/chat_stream.go<br/>SSE hub: per-engineer key + broadcast fallback"]
+        D["internal/handler/chat.go<br/>Escalate · SetPresence · Decline · Accept · CompleteSession<br/><br/>internal/handler/chat_stream.go<br/>SSE hub: per-engineer key + broadcast fallback"]
     end
 
     subgraph ROUTE["chat-routing-service :9096 — this service"]
-        F["internal/router.Router<br/>Escalate · SetPresence · Completed · Decline · GetPresence"]
+        F["internal/router.Router<br/>Escalate · SetPresence · Completed · Decline · Accept · GetPresence"]
     end
 
     subgraph PG["Persistence — one Postgres database, two schemas"]
@@ -98,7 +102,7 @@ next tier only when the previous one comes up empty:
 
 | Priority | Rule | Notes |
 |---|---|---|
-| 1 · Sticky | The engineer this customer was **most recently assigned to**, if that engineer is `AVAILABLE` and idle right now. | Looked up from `customer_engineer_assignments`. A `BUSY` or fully `OFFLINE` sticky engineer is skipped entirely — this reconnects a returning customer to a familiar face *when possible*, it never makes them wait on one specific person. |
+| 1 · Sticky | The engineer this customer was **most recently assigned to**, if that engineer is `AVAILABLE` and idle right now. | Looked up from `customer_engineer_assignments`. A `PENDING`, `BUSY`, or fully `OFFLINE` sticky engineer is skipped entirely — this reconnects a returning customer to a familiar face *when possible*, it never makes them wait on one specific person. |
 | 2 · Least busy | Whichever `AVAILABLE` engineer has been assigned the **fewest chats today**. | Computed live with `COUNT(*)` over `assignment_log` for `assigned_at` in `[CURRENT_DATE, CURRENT_DATE + 1)` — not a stored counter, so there's no lazy-reset bookkeeping to get wrong; an engineer with zero rows today is simply `0`. |
 | 3 · Tie-break | Among engineers tied on chats today, whoever has been `AVAILABLE` the **longest** (`available_since` ascending). | This is the same "came online first" ordering the original FIFO design used for everyone — now it only kicks in on a tie. |
 | 4 · Queue | If no engineer is `AVAILABLE` at all, the case joins `escalation_queue` (FIFO tail). | Unaffected by the above — once an engineer frees up, they take the queue head directly (see `SetPresence` / `Completed` below); sticky/least-busy ranking isn't re-applied to queued cases. |
@@ -114,24 +118,30 @@ engineer — it does not re-check the customer's sticky engineer.
 
 ## Presence state machine
 
+`PENDING` and `BUSY` are never a direct `SetPresence` request — only
+`AVAILABLE`/`OFFLINE` are. Both count as "has a current case" for every
+check below (mid-session handling, sticky routing eligibility, `Decline`'s
+own-case check); the only thing that separates them is `Router.Accept`.
+
 | From | Request | Result |
 |---|---|---|
-| any, idle | `AVAILABLE` | joins the pool (`available_since` set); if the queue is non-empty, immediately pops the head and assigns it (engineer becomes `BUSY`) |
-| any, idle | `BUSY` | manual "do not disturb" — out of the pool, no case |
+| any, idle | `AVAILABLE` | joins the pool (`available_since` set); if the queue is non-empty, immediately pops the head and assigns it (engineer becomes `PENDING`, not `BUSY` — see `Accept` below) |
 | any, idle | `OFFLINE` | out of the pool |
-| mid-session (`current_case` set) | `OFFLINE` requested | **deferred** — `pending_offline` is set, engineer stays `BUSY` until the session ends |
-| mid-session | `AVAILABLE`/`BUSY` requested | just clears `pending_offline` if it was set; the session itself is untouched (one dedicated session, can't free early) |
+| mid-session (`PENDING` or `BUSY`, `current_case` set) | `OFFLINE` requested | **deferred** — `pending_offline` is set, engineer stays `PENDING`/`BUSY` until the session ends |
+| mid-session | `AVAILABLE` requested | just clears `pending_offline` if it was set; the session itself is untouched (one dedicated session, can't free early) |
+| `PENDING` on `caseId` | `POST /route/accept {email, caseId}` | flips to `BUSY` — the engineer has now actually accepted. A stale accept (already declined/reassigned/accepted, or a different `caseId`) reports `{applied:false}` rather than erroring — see `Router.Accept`'s own doc comment. |
 
 **On session completion:** if `pending_offline` was set, the engineer goes
 straight to `OFFLINE` and does **not** rejoin the pool or take a queued
 case. Otherwise, the engineer becomes `AVAILABLE`, rejoins the pool, and the
-router immediately tries to hand them the queue head.
+router immediately tries to hand them the queue head (again as `PENDING`).
 
-**On decline** (dismissing an alert before accepting): the declining
-engineer is freed exactly like a completion, then the case is either handed
-to the next-best available engineer by the same least-busy/tie-break
-ranking (excluding the decliner), or pushed back onto the **front** of the
-queue — the customer already waited once.
+**On decline** (dismissing an alert before or after — functionally the
+same call — accepting): the declining engineer is freed exactly like a
+completion, then the case is either handed to the next-best available
+engineer by the same least-busy/tie-break ranking (excluding the
+decliner, and again assigned as `PENDING`), or pushed back onto the
+**front** of the queue — the customer already waited once.
 
 ## Data model
 
@@ -181,10 +191,11 @@ See `migrations/000001_create_engineers.up.sql`,
 `migrations/000002_create_escalation_queue.up.sql`,
 `migrations/000003_add_sticky_routing_and_chat_counts.up.sql`,
 `migrations/000004_engineer_id_primary_key.up.sql` (the `email` → `engineer_id`
-PK swap described above), and
+PK swap described above),
 `migrations/000005_dynamic_chat_counts.up.sql` (drops the old
-`chats_today`/`chats_today_date` columns in favor of `assignment_log`) for
-the exact schema, including the check constraints that keep
+`chats_today`/`chats_today_date` columns in favor of `assignment_log`), and
+`migrations/000006_add_pending_status.up.sql` (adds the `PENDING` enum
+value) for the exact schema, including the check constraints that keep
 `current_case_id`/`current_case` consistent and `available_since`
 meaningful only while truly idle-and-free.
 
@@ -200,7 +211,8 @@ All routes below `/route/*` require the `X-Routing-Service-Token` header
 | `POST` | `/route/presence` | `{email, engineerId, status}` | `{applied, pendingOffline?, assignedCase?}` |
 | `POST` | `/route/completed` | `{email}` | `{removed, rejoined, assignedCase?}` |
 | `POST` | `/route/decline` | `{email, caseId}` | `{reassignedTo?, requeued?}` |
-| `GET` | `/route/presence/{email}` | — | `{status}` (defaults to `OFFLINE` for an unseen engineer) |
+| `POST` | `/route/accept` | `{email, caseId}` | `{applied}` — `PENDING` → `BUSY`; `false` if stale (see [Presence state machine](#presence-state-machine)) |
+| `GET` | `/route/presence/{email}` | — | `{status, currentCase?}` (defaults to `OFFLINE`, no case, for an unseen engineer; `currentCase` is set when `PENDING` or `BUSY`) |
 | `GET` | `/route/debug/state` | — | full dump of `engineers` (incl. today's chat count) + `escalation_queue` — verification only |
 | `GET` | `/health` | — | `200 OK` |
 

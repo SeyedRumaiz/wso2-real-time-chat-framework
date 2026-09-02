@@ -72,7 +72,7 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 
 func isValidStatus(s string) bool {
 	switch router.Status(s) {
-	case router.StatusAvailable, router.StatusBusy, router.StatusOffline:
+	case router.StatusAvailable, router.StatusPending, router.StatusBusy, router.StatusOffline:
 		return true
 	default:
 		return false
@@ -137,7 +137,7 @@ func (h *RoutingHandler) SetPresence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Email == "" || req.EngineerID == "" || !isValidStatus(req.Status) {
-		writeError(w, http.StatusBadRequest, "email, engineerId, and a valid status (AVAILABLE|BUSY|OFFLINE) are required.")
+		writeError(w, http.StatusBadRequest, "email, engineerId, and a valid status (AVAILABLE|OFFLINE) are required.")
 		return
 	}
 
@@ -198,19 +198,53 @@ func (h *RoutingHandler) Decline(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// GetPresence handles GET /route/presence/{email}.
+// acceptRequest is the body for POST /route/accept.
+type acceptRequest struct {
+	Email  string `json:"email"`
+	CaseID string `json:"caseId"`
+}
+
+// Accept handles POST /route/accept -- confirms email is accepting the
+// case they were assigned (PENDING -> BUSY). See router.Router.Accept's
+// own doc comment for when Applied comes back false instead of erroring.
+func (h *RoutingHandler) Accept(w http.ResponseWriter, r *http.Request) {
+	var req acceptRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.Email == "" || req.CaseID == "" {
+		writeError(w, http.StatusBadRequest, "email and caseId are required.")
+		return
+	}
+
+	result, err := h.router.Accept(r.Context(), req.Email, req.CaseID)
+	if err != nil {
+		writeStorageError(w, "accept", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GetPresence handles GET /route/presence/{email}. Includes currentCase
+// (omitted when there is none) so a caller whose own UI state for a
+// pending alert or active session was lost -- a browser refresh, a closed
+// tab -- can rehydrate it instead of the engineer being stuck PENDING or
+// BUSY with nothing to act on (see router.Router.PresenceDetail).
 func (h *RoutingHandler) GetPresence(w http.ResponseWriter, r *http.Request) {
 	email := r.PathValue("email")
 	if email == "" {
 		writeError(w, http.StatusBadRequest, "email is required.")
 		return
 	}
-	status, err := h.router.GetPresence(r.Context(), email)
+	detail, err := h.router.GetPresence(r.Context(), email)
 	if err != nil {
 		writeStorageError(w, "presence:get", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]router.Status{"status": status})
+	writeJSON(w, http.StatusOK, struct {
+		Status      router.Status    `json:"status"`
+		CurrentCase *router.CaseInfo `json:"currentCase,omitempty"`
+	}{Status: detail.Status, CurrentCase: detail.CurrentCase})
 }
 
 // DebugState handles GET /route/debug/state — see router.DebugState's own
