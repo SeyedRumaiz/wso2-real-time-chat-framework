@@ -89,6 +89,10 @@ func main() {
 	mux.HandleFunc("POST /route/decline", h.Decline)
 	mux.HandleFunc("POST /route/accept", h.Accept)
 	mux.HandleFunc("GET /route/presence/{email}", h.GetPresence)
+	// Local stand-in persistence endpoints -- see internal/router/workitem.go.
+	mux.HandleFunc("POST /route/workitem", h.CreateWorkItem)
+	mux.HandleFunc("POST /route/comment", h.AddComment)
+	mux.HandleFunc("GET /route/debug/workitem/{caseId}", h.DebugWorkItem)
 	mux.HandleFunc("GET /route/debug/state", h.DebugState)
 
 	// /health is deliberately outside the InternalToken gate below (an

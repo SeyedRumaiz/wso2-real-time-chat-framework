@@ -247,6 +247,82 @@ func (h *RoutingHandler) GetPresence(w http.ResponseWriter, r *http.Request) {
 	}{Status: detail.Status, CurrentCase: detail.CurrentCase})
 }
 
+// workItemRequest is the body for POST /route/workitem -- see
+// router.Router.CreateWorkItem.
+type workItemRequest struct {
+	CaseID         string `json:"caseId"`
+	ConversationID string `json:"conversationId"`
+	CreatorEmail   string `json:"creatorEmail"`
+	Subject        string `json:"subject"`
+	InitialMessage string `json:"initialMessage"`
+}
+
+// CreateWorkItem handles POST /route/workitem -- LOCAL STAND-IN endpoint,
+// see router/workitem.go's package doc comment. Called once per escalation
+// from csm-portal/backend's HandleEscalate, regardless of routing outcome.
+func (h *RoutingHandler) CreateWorkItem(w http.ResponseWriter, r *http.Request) {
+	var req workItemRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.CaseID == "" || req.ConversationID == "" || req.CreatorEmail == "" || req.Subject == "" {
+		writeError(w, http.StatusBadRequest, "caseId, conversationId, creatorEmail, and subject are required.")
+		return
+	}
+
+	if err := h.router.CreateWorkItem(r.Context(), req.CaseID, req.ConversationID, req.CreatorEmail, req.Subject, req.InitialMessage); err != nil {
+		writeStorageError(w, "workitem:create", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]bool{"created": true})
+}
+
+// commentRequest is the body for POST /route/comment -- see
+// router.Router.AddComment.
+type commentRequest struct {
+	CaseID      string `json:"caseId"`
+	AuthorEmail string `json:"authorEmail"`
+	Content     string `json:"content"`
+}
+
+// AddComment handles POST /route/comment -- LOCAL STAND-IN endpoint, see
+// router/workitem.go's package doc comment. Called for both directions of
+// a live chat message (customer and engineer) -- see csm-portal/backend's
+// HandleCustomerMessage and HandleEngineerMessage.
+func (h *RoutingHandler) AddComment(w http.ResponseWriter, r *http.Request) {
+	var req commentRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.CaseID == "" || req.AuthorEmail == "" || req.Content == "" {
+		writeError(w, http.StatusBadRequest, "caseId, authorEmail, and content are required.")
+		return
+	}
+
+	if err := h.router.AddComment(r.Context(), req.CaseID, req.AuthorEmail, req.Content); err != nil {
+		writeStorageError(w, "comment:add", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]bool{"added": true})
+}
+
+// DebugWorkItem handles GET /route/debug/workitem/{caseId} -- LOCAL
+// STAND-IN endpoint, verification-only, mirroring DebugState's own reason
+// for existing.
+func (h *RoutingHandler) DebugWorkItem(w http.ResponseWriter, r *http.Request) {
+	caseID := r.PathValue("caseId")
+	if caseID == "" {
+		writeError(w, http.StatusBadRequest, "caseId is required.")
+		return
+	}
+	detail, err := h.router.DebugWorkItem(r.Context(), caseID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
 // DebugState handles GET /route/debug/state — see router.DebugState's own
 // doc comment on why this exists.
 func (h *RoutingHandler) DebugState(w http.ResponseWriter, r *http.Request) {

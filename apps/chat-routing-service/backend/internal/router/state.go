@@ -465,6 +465,20 @@ func (r *Router) Accept(ctx context.Context, email, caseID string) (AcceptResult
 		`, email); err != nil {
 			return fmt.Errorf("accept case: %w", err)
 		}
+
+		// Local stand-in persistence (see workitem.go) -- records the
+		// accepting engineer on chat_conversation in the SAME transaction
+		// as the PENDING -> BUSY flip, so the two can never disagree about
+		// whether an accept actually went through. A caseID with no
+		// chat_conversation row (this stand-in added after some in-flight
+		// cases already existed, or CreateWorkItem's own best-effort call
+		// having failed) is a plain UPDATE-matches-zero-rows no-op here,
+		// not an error -- the real presence flip above must not fail
+		// because of a stand-in bookkeeping gap. setConversationEngineer
+		// only returns an error for an actual database failure.
+		if err := setConversationEngineer(ctx, tx, caseID, email); err != nil {
+			return err
+		}
 		result = AcceptResult{Applied: true}
 		return nil
 	})
