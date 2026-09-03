@@ -14,8 +14,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { useMutation, type UseMutationResult } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueryClient,
+  type UseMutationResult,
+} from "@tanstack/react-query";
 import { useBackendApi } from "@api/backend/client";
+import { ENGINEER_STATUS_QUERY_KEY } from "./useEngineerStatus";
 
 export interface AcceptChatSessionInput {
   caseId: string;
@@ -25,9 +30,16 @@ export interface AcceptChatSessionInput {
 /**
  * Accepts a live-engineer-chat session: POST /chat/sessions/{caseId}/accept
  * (see csm-portal/backend's internal/handler/chat.go HandleAcceptSession).
- * Assigns the case to the calling engineer (first to accept wins — no
- * claim/lock table) and notifies both the other connected engineers and the
- * customer's chat.
+ * Assigns the case to the calling engineer (confirmed server-side via
+ * router.Router.Accept's PENDING -> BUSY check) and notifies both the other
+ * connected engineers and the customer's chat.
+ *
+ * Invalidates the status dropdown's query on success, matching
+ * useCompleteChatSession/useDeclineChatSession/useSetEngineerStatus's own
+ * pattern -- without this, the dropdown kept showing PENDING (its cached
+ * value from when the alert first arrived, see EngineerAlertNotification's
+ * handleAlert) for the entire chat, since nothing ever told it to refetch
+ * the BUSY status this call itself just caused server-side.
  */
 export function useAcceptChatSession(): UseMutationResult<
   { message: string },
@@ -35,11 +47,15 @@ export function useAcceptChatSession(): UseMutationResult<
   AcceptChatSessionInput
 > {
   const api = useBackendApi();
+  const queryClient = useQueryClient();
 
   return useMutation<{ message: string }, Error, AcceptChatSessionInput>({
     mutationFn: ({ caseId, conversationId }) =>
       api.post(`/chat/sessions/${encodeURIComponent(caseId)}/accept`, {
         conversationId,
       }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ENGINEER_STATUS_QUERY_KEY });
+    },
   });
 }
