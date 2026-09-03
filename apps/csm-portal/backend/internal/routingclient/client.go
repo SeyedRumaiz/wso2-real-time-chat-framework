@@ -254,6 +254,38 @@ func (c *Client) Accept(ctx context.Context, email, caseID string) (AcceptResult
 	return out, err
 }
 
+// CreateWorkItem calls POST /route/workitem -- LOCAL STAND-IN persistence,
+// see chat-routing-service's internal/router/workitem.go package doc
+// comment and the project's chat-persistence-mapping-plan.md. Creates the
+// work_item + chat_conversation pair (plus the first comment, if
+// initialMessage is non-empty) for a brand-new escalation.
+func (c *Client) CreateWorkItem(ctx context.Context, caseID, conversationID, creatorEmail, subject, initialMessage string) error {
+	body := struct {
+		CaseID         string `json:"caseId"`
+		ConversationID string `json:"conversationId"`
+		CreatorEmail   string `json:"creatorEmail"`
+		Subject        string `json:"subject"`
+		InitialMessage string `json:"initialMessage,omitempty"`
+	}{
+		CaseID: caseID, ConversationID: conversationID, CreatorEmail: creatorEmail,
+		Subject: subject, InitialMessage: initialMessage,
+	}
+	return c.do(ctx, http.MethodPost, "/route/workitem", body, nil)
+}
+
+// AddComment calls POST /route/comment -- LOCAL STAND-IN persistence, same
+// caveat as CreateWorkItem above. Used for both directions of a live chat
+// message (customer and engineer) so the whole transcript lands in one
+// place.
+func (c *Client) AddComment(ctx context.Context, caseID, authorEmail, content string) error {
+	body := struct {
+		CaseID      string `json:"caseId"`
+		AuthorEmail string `json:"authorEmail"`
+		Content     string `json:"content"`
+	}{CaseID: caseID, AuthorEmail: authorEmail, Content: content}
+	return c.do(ctx, http.MethodPost, "/route/comment", body, nil)
+}
+
 // PresenceDetail is GetPresence's result -- status plus, when PENDING or
 // BUSY, the case the engineer is currently on (nil otherwise). CurrentCase
 // exists so a caller can rehydrate an active alert or session's UI state

@@ -256,10 +256,13 @@ type sendMessageRequestBody struct {
 // HandleSendMessage handles
 // POST /projects/{id}/support/chat/{conversationId}/message. Unlike the AI
 // chat path (WebSocketHandler.handleMessage), a human-attended message is
-// NOT persisted here as a conversation comment — csm-portal/backend
-// persists it as a case comment instead (see that backend's
-// HandleCustomerMessage), since the case is the operative record once a
-// human has taken over. This handler is a thin, purely relaying call.
+// NOT persisted here — csm-portal/backend persists it instead, via the
+// LOCAL STAND-IN routing-service tables (see that backend's
+// HandleCustomerMessage and the project's chat-persistence-mapping-plan.md),
+// since the case is still the operative record for routing purposes once a
+// human has taken over, even though message storage itself has moved off
+// entity-service's case_comments. This handler is a thin, purely relaying
+// call.
 func (h *ChatEscalationHandler) HandleSendMessage(w http.ResponseWriter, r *http.Request) {
 	user := middleware.UserInfoFromContext(r.Context())
 	if user == nil {
@@ -288,6 +291,12 @@ func (h *ChatEscalationHandler) HandleSendMessage(w http.ResponseWriter, r *http
 		"caseId":         req.CaseID,
 		"conversationId": conversationID,
 		"message":        req.Message,
+		// customerEmail attributes this message's persisted record to the
+		// actual sender -- see csm-portal/backend's HandleCustomerMessage,
+		// which uses it as internal/router.AddComment's authorEmail (a
+		// local stand-in for entity-service's eventual generic comment
+		// table; see the project's chat-persistence-mapping-plan.md).
+		"customerEmail": user.Email,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, ErrMsgInternal)

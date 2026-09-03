@@ -20,8 +20,15 @@
 //
 // Design, and why it looks the way it does:
 //
-//   - A "chat message" during a live session is just a case_comment on the
-//     case the escalation created — there is no new chat/message table. See
+//   - A "chat message" during a live session is persisted via LOCAL
+//     STAND-IN routing-service tables (work_item/chat_conversation/comment
+//     inside chat-routing-service's own database — see routingService's
+//     AddComment/CreateWorkItem and that service's internal/router/
+//     workitem.go) rather than entity-service, since entity-service's real
+//     generic work-item schema isn't ready yet (see the project's
+//     chat-persistence-mapping-plan.md doc) and entity's CreateCaseComment
+//     never worked for the customer's half of the conversation anyway (no
+//     x-user-id-token on that internal call). See HandleCustomerMessage/
 //     HandleEngineerMessage.
 //   - "Accepting" a session is just PATCH /cases/{id} with assigneeEmail —
 //     no separate claim/lock table, no SELECT ... FOR UPDATE SKIP LOCKED.
@@ -103,10 +110,13 @@ const chatNotifyTimeout = 5 * time.Second
 
 // entityChatClient is the subset of the entity client this feature needs.
 // customerEntityClient (cmd/server/main.go) already implements this — see
-// internal/entity/customer.go's CreateCaseComment/PatchCase.
+// internal/entity/customer.go's PatchCase. CreateCaseComment used to be
+// part of this (both message directions persisted through it) but both
+// HandleCustomerMessage and HandleEngineerMessage now go through the LOCAL
+// STAND-IN routingService.AddComment instead (see that interface's own doc
+// comment) -- entity's CreateCaseComment is no longer called by this file.
 type entityChatClient interface {
 	PatchCase(ctx context.Context, caseID string, body []byte) ([]byte, error)
-	CreateCaseComment(ctx context.Context, caseID string, body []byte) ([]byte, error)
 }
 
 // chatEventPusher abstracts internal/chatnotify.Client so tests can fake the
@@ -125,6 +135,13 @@ type routingService interface {
 	Decline(ctx context.Context, email, caseID string) (routingclient.DeclineResult, error)
 	Accept(ctx context.Context, email, caseID string) (routingclient.AcceptResult, error)
 	GetPresence(ctx context.Context, email string) (routingclient.PresenceDetail, error)
+	// CreateWorkItem and AddComment are LOCAL STAND-IN persistence calls
+	// (see routingclient.Client.CreateWorkItem's doc comment and the
+	// project's chat-persistence-mapping-plan.md) -- they exist only until
+	// entity-service's real generic work_item/chat_conversation/comment
+	// schema ships, at which point these calls move there instead.
+	CreateWorkItem(ctx context.Context, caseID, conversationID, creatorEmail, subject, initialMessage string) error
+	AddComment(ctx context.Context, caseID, authorEmail, content string) error
 }
 
 // ChatHandler implements the live-engineer-chat escalation endpoints.
@@ -316,6 +333,15 @@ func (h *ChatHandler) HandleEscalate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Best-effort: LOCAL STAND-IN persistence (see routingService's own doc
+	// comment) -- creates the work_item/chat_conversation/first-comment
+	// record for this escalation. Must not block the live routing decision
+	// above, which has already succeeded and must reach the customer
+	// regardless of whether this bookkeeping call does.
+	if err := h.routing.CreateWorkItem(r.Context(), req.CaseID, req.ConversationID, req.CustomerEmail, ci.Subject, req.Message); err != nil {
+		slog.WarnContext(r.Context(), "chat: routing service create work item failed (non-blocking)", "caseId", req.CaseID, "err", err)
+	}
+
 	switch {
 	case result.EngineerEmail != "":
 		h.publishToEngineer(result.EngineerEmail, assignedCaseEvent(ci))
@@ -339,17 +365,25 @@ type customerMessageRequest struct {
 	CaseID         string `json:"caseId"`
 	ConversationID string `json:"conversationId"`
 	Message        string `json:"message"`
+	// CustomerEmail attributes the persisted comment to its actual sender
+	// (see AddComment below) -- added alongside the LOCAL STAND-IN
+	// persistence work, see routingService's own doc comment.
+	CustomerEmail string `json:"customerEmail"`
 }
 
 // HandleCustomerMessage handles POST /internal/chat/customer-message. Also
 // internal-listener-only (see HandleEscalate). Persists the customer's
-// message as a case comment — the entity-service write of record for this
-// feature (see the package doc comment) — then fans it out over the shared
-// broadcastHubKey so whichever engineer accepted the session sees it live.
-// Deliberately still broadcast rather than targeted at the accepting
-// engineer specifically (this handler has no record of who that is — see
-// the package doc comment on why there is no server-side session table);
-// an accepted scope decision for this prototype phase.
+// message as a comment via the LOCAL STAND-IN routing-service tables (see
+// routingService's own doc comment) — entity-service's real CreateCaseComment
+// was never usable here (this internal, service-to-service call from
+// backend-v2 has no customer browser session behind it, so there is no
+// x-user-id-token to give entity-service, and that write 401s every time)
+// — then fans the message out over the shared broadcastHubKey so whichever
+// engineer accepted the session sees it live. Deliberately still broadcast
+// rather than targeted at the accepting engineer specifically (this handler
+// has no record of who that is — see the package doc comment on why there
+// is no server-side session table); an accepted scope decision for this
+// prototype phase.
 func (h *ChatHandler) HandleCustomerMessage(w http.ResponseWriter, r *http.Request) {
 	body, ok := readChatBody(w, r)
 	if !ok {
@@ -366,22 +400,13 @@ func (h *ChatHandler) HandleCustomerMessage(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	commentBody, err := json.Marshal(map[string]string{"type": "comment", "content": req.Message})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, ErrMsgInternal)
-		return
-	}
-	// Best-effort: this is an internal, service-to-service call from
-	// backend-v2 with no customer browser session behind it, so there is no
-	// x-user-id-token to give entity-service — and entity's CreateCaseComment
-	// (unlike CreateCase) has no way to accept a pre-supplied author for a
-	// trusted internal caller, so this write is expected to 401 there today.
-	// That must not block the live relay below: the customer is mid-chat
-	// with an engineer right now, and losing the case's audit-trail comment
-	// is far less costly than silently dropping their message entirely
-	// (which returning early here used to do).
-	if _, err := h.entity.CreateCaseComment(r.Context(), req.CaseID, commentBody); err != nil {
-		slog.WarnContext(r.Context(), "entity CreateCaseComment failed for customer chat message (non-blocking)", "caseID", req.CaseID, "err", err)
+	// Best-effort: must not block the live relay below. The customer is
+	// mid-chat with an engineer right now, and losing this message's
+	// durable record is far less costly than silently dropping the message
+	// itself (which returning early here used to do, back when this was a
+	// blocking entity-service call).
+	if err := h.routing.AddComment(r.Context(), req.CaseID, req.CustomerEmail, req.Message); err != nil {
+		slog.WarnContext(r.Context(), "chat: routing service add comment failed for customer chat message (non-blocking)", "caseID", req.CaseID, "err", err)
 	}
 
 	h.publishToEngineers(chatEvent{
@@ -460,10 +485,12 @@ func (h *ChatHandler) HandleAcceptSession(w http.ResponseWriter, r *http.Request
 	// assigneeEmail with 400, regardless of the case's actual data source
 	// (see case_service.go's UpdateCase). Every case created via the chat-
 	// escalation path is a Postgres case, so this call is expected to fail
-	// there. The routing service already reserved this engineer's capacity
-	// at assignment time (see HandleEscalate/HandleSetPresence), so a
-	// failure here must not block accepting — it only means the case row
-	// itself won't reflect who picked it up.
+	// there. This is no longer the only record of who accepted, though:
+	// Router.Accept (just above) already durably set chat_conversation.
+	// engineer_id in the LOCAL STAND-IN tables in the same transaction as
+	// the PENDING -> BUSY flip. This PatchCase attempt is kept anyway, on
+	// the chance entity-service ever adds a real assignee column — a
+	// failure here must not block accepting either way.
 	if _, err := h.entity.PatchCase(r.Context(), caseID, patchBody); err != nil {
 		slog.WarnContext(r.Context(), "entity PatchCase failed accepting chat session (non-blocking)", "userID", user.UserID, "caseID", caseID, "err", err)
 	}
@@ -496,10 +523,10 @@ type engineerMessageRequest struct {
 
 // HandleEngineerMessage handles POST /chat/sessions/{id}/messages —
 // browser-facing, behind Auth. {id} is the case ID. Persists the engineer's
-// reply as a case comment (the same write CreateCaseComment already makes
-// for every other case comment — see cases.go), then relays it to the
-// customer's already-open WebSocket via backend-v2's internal push (see the
-// package doc comment on why this direction uses a push instead of SSE).
+// reply via the LOCAL STAND-IN routing-service tables (see routingService's
+// own doc comment), then relays it to the customer's already-open WebSocket
+// via backend-v2's internal push (see the package doc comment on why this
+// direction uses a push instead of SSE).
 func (h *ChatHandler) HandleEngineerMessage(w http.ResponseWriter, r *http.Request) {
 	user := middleware.UserInfoFromContext(r.Context())
 	if user == nil {
@@ -523,15 +550,16 @@ func (h *ChatHandler) HandleEngineerMessage(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	commentBody, err := json.Marshal(map[string]string{"type": "comment", "content": req.Message})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, ErrMsgInternal)
-		return
-	}
-	if _, err := h.entity.CreateCaseComment(r.Context(), caseID, commentBody); err != nil {
-		slog.ErrorContext(r.Context(), "entity CreateCaseComment failed for engineer chat message", "userID", user.UserID, "caseID", caseID, "err", err)
-		mapUpstreamErrorGeneric(w, err, "Failed to send message.")
-		return
+	// Best-effort, matching HandleCustomerMessage's own philosophy for the
+	// other direction of this same transcript (see routingService's doc
+	// comment) -- an engineer's message must still reach the customer over
+	// notifyBackendV2 below even if this LOCAL STAND-IN persistence call
+	// fails. Previously this was a blocking entity.CreateCaseComment call;
+	// moved here so both directions of the conversation land in the same
+	// place (the stand-in comment table) instead of being split across two
+	// storage systems -- see the project's chat-persistence-mapping-plan.md.
+	if err := h.routing.AddComment(r.Context(), caseID, user.Email, req.Message); err != nil {
+		slog.WarnContext(r.Context(), "chat: routing service add comment failed for engineer chat message (non-blocking)", "userID", user.UserID, "caseID", caseID, "err", err)
 	}
 
 	h.notifyBackendV2(r.Context(), chatEvent{
