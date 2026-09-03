@@ -24,6 +24,19 @@
 // persistence can be built and tested today. Once entity-service's real
 // version ships, csm-portal/backend's calls should move there instead, and
 // everything in this file (plus migrations/000007) should be deleted.
+//
+// These tables live in this service's own "chat_routing" Postgres schema,
+// same as everything else in this package (engineers, escalation_queue,
+// ...) -- resolved via this service's own search_path (see internal/
+// config.Schema / internal/db.NewPool), so every query below uses plain
+// unqualified table names. A version of this that instead put these three
+// tables in entity-service's own schema was tried and reverted on
+// 2026-09-03 -- see the migration's own doc comment and the project's
+// chat-persistence-mapping-plan.md for why: two services each owning their
+// own schema is a sound, normal pattern, and keeping this stand-in fully
+// inside chat-routing-service's own schema/migration history avoids any
+// version or table-name collision with entity-service's own eventual real
+// work_item/chat_conversation/comment migration.
 package router
 
 import (
