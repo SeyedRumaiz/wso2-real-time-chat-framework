@@ -2,6 +2,9 @@ openapi: 3.0.1
 info:
   title: Chat Routing Service API
   version: 1.0.0
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
   description: >-
     Decides which engineer (if any) picks up a live-engineer-chat escalation,
     and persists engineer presence, the FIFO waiting queue, and per-customer
@@ -28,7 +31,7 @@ info:
     `GET /route/debug/workitem/{caseId}` are verification/debugging aids,
     not meant for production traffic.
 servers:
-  - url: "{server}:{port}/"
+  - url: "{server}:{port}"
     variables:
       server:
         default: http://localhost
@@ -81,6 +84,8 @@ paths:
                 $ref: '#/components/schemas/EscalateResponse'
         "400":
           $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
@@ -111,6 +116,8 @@ paths:
                 $ref: '#/components/schemas/PresenceResponse'
         "400":
           $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
@@ -140,6 +147,8 @@ paths:
                 $ref: '#/components/schemas/CompletedResponse'
         "400":
           $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
@@ -169,6 +178,8 @@ paths:
                 $ref: '#/components/schemas/DeclineResponse'
         "400":
           $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
@@ -189,12 +200,15 @@ paths:
               $ref: '#/components/schemas/AcceptRequest'
       responses:
         "200":
+          description: applied is false when the accept is stale — see the AcceptResponse schema.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/AcceptResponse'
         "400":
           $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
@@ -222,6 +236,8 @@ paths:
                 $ref: '#/components/schemas/PresenceDetailResponse'
         "400":
           $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
@@ -241,6 +257,7 @@ paths:
               $ref: '#/components/schemas/WorkItemRequest'
       responses:
         "201":
+          description: The stand-in work_item/chat_conversation rows were created.
           content:
             application/json:
               schema:
@@ -250,6 +267,8 @@ paths:
                     type: boolean
         "400":
           $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
@@ -269,6 +288,7 @@ paths:
               $ref: '#/components/schemas/CommentRequest'
       responses:
         "201":
+          description: The message was persisted as a comment row.
           content:
             application/json:
               schema:
@@ -278,6 +298,8 @@ paths:
                     type: boolean
         "400":
           $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
@@ -300,6 +322,8 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "401":
+          $ref: '#/components/responses/Unauthorized'
         "404":
           description: No work item exists for that caseId.
           content:
@@ -314,11 +338,14 @@ paths:
       operationId: debugState
       responses:
         "200":
+          description: engineers (with today's live chat count) and the current escalation_queue contents.
           content:
             application/json:
               schema:
                 type: object
                 additionalProperties: true
+        "401":
+          $ref: '#/components/responses/Unauthorized'
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
@@ -334,6 +361,14 @@ components:
         browser-facing code — see README.md's security notes.
 
   responses:
+    Unauthorized:
+      description: >-
+        Missing or incorrect X-Routing-Service-Token header (see the
+        RoutingServiceToken security scheme).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
     BadRequest:
       description: Missing/invalid required field(s).
       content:
@@ -386,8 +421,7 @@ components:
           type: string
 
     EscalateRequest:
-      allOf:
-        - $ref: '#/components/schemas/CaseInfo'
+      $ref: '#/components/schemas/CaseInfo'
 
     EscalateResponse:
       type: object
