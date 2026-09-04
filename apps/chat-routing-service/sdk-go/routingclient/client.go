@@ -14,20 +14,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Package routingclient is the outbound HTTP client this backend uses to
-// call the standalone chat-routing-service (apps/chat-routing-service/
-// backend) — the in-memory engineer availability/queue state machine that
-// decides which engineer (if any) an escalation is routed to. See that
-// service's internal/handler/routes.go for the exact routes and response
-// shapes this client mirrors.
+// Package routingclient is the client SDK for chat-routing-service
+// (apps/chat-routing-service/backend) — the in-memory engineer
+// availability/queue state machine that decides which engineer (if any) an
+// escalation is routed to. See that service's internal/handler/routes.go
+// for the exact routes and response shapes this client mirrors.
 //
-// Like internal/chatnotify, this is a server-to-server call authenticated
-// with a shared bearer secret (X-Routing-Service-Token) rather than a user
-// JWT, since the two processes do not share a JWT audience/issuer for a
-// "service identity". Unlike chatnotify's fire-and-forget PushEvent, every
-// call here has a typed response the caller acts on synchronously (e.g. an
-// escalation needs to know which engineer, if any, to publish the alert
-// to) — so this client encodes/decodes JSON rather than passing raw bytes.
+// # Server-to-server only
+//
+// Every call here is authenticated with a shared bearer secret
+// (X-Routing-Service-Token) rather than a user JWT — chat-routing-service
+// and its callers do not share a JWT audience/issuer for a "service
+// identity", so this is a static, pre-shared secret instead. That makes
+// this client safe to use only from a backend process that can hold a
+// secret: never construct a Client in code that ships to a browser or any
+// other untrusted runtime, and never proxy this token through to one. A
+// frontend that needs routing decisions should keep calling its own
+// backend's proxy endpoints (see apps/csm-portal/backend/internal/handler/
+// chat.go's HandleEscalate/HandleSetPresence/etc.), which hold this
+// Client server-side and never expose InternalToken to the browser.
+//
+// # Versioning
+//
+// This module is nested inside the wso2-open-operations/cs-tools monorepo
+// at apps/chat-routing-service/sdk-go and is versioned independently of
+// both chat-routing-service/backend and any of its callers, via git tags
+// scoped to this directory (e.g. apps/chat-routing-service/sdk-go/v0.1.0).
+// A breaking change to chat-routing-service's HTTP API should land here as
+// a new type/method (or a major version bump) rather than a silent
+// behavior change to an existing one, since callers pin a version like any
+// other Go dependency.
 package routingclient
 
 import (
@@ -56,11 +72,14 @@ type Config struct {
 	// "http://localhost:9096" (ROUTING_SERVICE_BASE_URL).
 	BaseURL string
 	// InternalToken is the shared secret sent as X-Routing-Service-Token.
-	// Must equal that service's own ROUTING_SERVICE_TOKEN.
+	// Must equal that service's own ROUTING_SERVICE_TOKEN. Load this from
+	// your own process's environment/secret store — never hardcode it,
+	// and never let it reach client-side code (see the package doc above).
 	InternalToken string
 }
 
-// Client calls the chat-routing-service.
+// Client calls the chat-routing-service. Safe for concurrent use by
+// multiple goroutines (holds no mutable state beyond its *http.Client).
 type Client struct {
 	http    *http.Client
 	baseURL string
@@ -69,10 +88,11 @@ type Client struct {
 
 // NewClient constructs a Client. Does not validate connectivity — the first
 // call surfaces a dial failure; callers decide per-endpoint whether that is
-// fatal to the caller-facing request (HandleEscalate falls back to
-// broadcasting; presence/completed/decline calls are best-effort, matching
-// this feature's existing "a failed side-channel push never blocks the
-// request that already succeeded" philosophy — see chatnotify.NewClient).
+// fatal to the caller-facing request (chat-routing-service's callers
+// typically fall back to a degraded default for user-facing calls like
+// Escalate, and log-and-continue for best-effort side-channel calls like
+// Completed/Decline — see apps/csm-portal/backend/internal/handler/chat.go
+// for a worked example of both).
 func NewClient(cfg Config) *Client {
 	return &Client{
 		http:    &http.Client{Timeout: 10 * time.Second},
@@ -82,9 +102,9 @@ func NewClient(cfg Config) *Client {
 }
 
 // Status mirrors chat-routing-service/backend/internal/router.Status.
-// Duplicated rather than shared via a common module: these are two
-// independently deployable services, and this HTTP API is their only
-// coupling point.
+// Duplicated rather than shared via a common package: chat-routing-service
+// and this SDK are versioned and deployed independently, and this HTTP API
+// is their only coupling point.
 type Status string
 
 const (
@@ -137,7 +157,7 @@ type DeclineResult struct {
 	ReassignedTo string `json:"reassignedTo,omitempty"`
 	Requeued     bool   `json:"requeued,omitempty"`
 	// AssignedCase is set alongside ReassignedTo — the declined case, now
-	// handed to that other engineer, in the same shape HandleEscalate would
+	// handed to that other engineer, in the same shape Escalate would
 	// have delivered it in originally.
 	AssignedCase *CaseInfo `json:"assignedCase,omitempty"`
 }
@@ -201,11 +221,11 @@ func (c *Client) Escalate(ctx context.Context, ci CaseInfo) (EscalateResult, err
 
 // SetPresence calls POST /route/presence, applying an engineer's requested
 // status change (see router.Router.SetPresence's doc comment for the full
-// state machine this triggers). engineerID is the IdP's stable per-account
-// "userid" claim (middleware.UserInfo.UserID) -- the routing service only
-// uses it the first time it sees email, to populate that new row's
-// engineer_id primary key; it's ignored (not an error) on every later call
-// for an already-known email.
+// state machine this triggers). engineerID is the caller's stable
+// per-account identifier (e.g. an IdP "userid" claim) -- the routing
+// service only uses it the first time it sees email, to populate that new
+// row's engineer_id primary key; it's ignored (not an error) on every
+// later call for an already-known email.
 func (c *Client) SetPresence(ctx context.Context, email, engineerID string, status Status) (PresenceResult, error) {
 	var out PresenceResult
 	body := struct {
@@ -256,9 +276,8 @@ func (c *Client) Accept(ctx context.Context, email, caseID string) (AcceptResult
 
 // CreateWorkItem calls POST /route/workitem -- LOCAL STAND-IN persistence,
 // see chat-routing-service's internal/router/workitem.go package doc
-// comment and the project's chat-persistence-mapping-plan.md. Creates the
-// work_item + chat_conversation pair (plus the first comment, if
-// initialMessage is non-empty) for a brand-new escalation.
+// comment. Creates the work_item + chat_conversation pair (plus the first
+// comment, if initialMessage is non-empty) for a brand-new escalation.
 func (c *Client) CreateWorkItem(ctx context.Context, caseID, conversationID, creatorEmail, subject, initialMessage string) error {
 	body := struct {
 		CaseID         string `json:"caseId"`

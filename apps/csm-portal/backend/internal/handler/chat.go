@@ -76,8 +76,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/wso2-open-operations/cs-tools/apps/chat-routing-service/sdk-go/routingclient"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
-	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/routingclient"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/stream"
 )
 

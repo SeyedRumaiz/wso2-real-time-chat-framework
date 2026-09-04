@@ -33,6 +33,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wso2-open-operations/cs-tools/apps/chat-routing-service/sdk-go/routingclient"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/caseevents"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/chatnotify"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/dashboard"
@@ -41,7 +42,6 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/eventpublisher"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/handler"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
-	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/routingclient"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/scim"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/stream"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/updates"
