@@ -248,20 +248,35 @@ type CompletedResult struct {
 // while busy) or returns them to AVAILABLE -- immediately assigning the
 // next queued case to them, if any, exactly like SetPresence's own
 // queue-drain-on-AVAILABLE behavior. A no-op (zero CompletedResult) if
-// email has no row at all.
+// email has no row at all, OR if email has no current_case_id right now --
+// the latter guards against a duplicate/stale call for a session that was
+// already completed (e.g. csm-portal/backend's HandleCompleteSession being
+// hit twice for the same case, which can happen client-side if a UI
+// briefly resurrects a just-ended session from a stale cached read before
+// its own refetch lands -- see EngineerAlertNotification.tsx). Without this
+// guard, a second call here would re-derive AVAILABLE-vs-OFFLINE from
+// pending_offline's value AFTER the first call already reset it to false,
+// silently overwriting whatever that first call correctly decided.
 func (r *Router) Completed(ctx context.Context, email string) (CompletedResult, error) {
 	var result CompletedResult
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
-		var pendingOffline bool
+		var (
+			pendingOffline bool
+			currentCaseID  *string
+		)
 		err := tx.QueryRow(ctx, `
-			SELECT pending_offline FROM engineers WHERE email = $1 FOR UPDATE
-		`, email).Scan(&pendingOffline)
+			SELECT pending_offline, current_case_id FROM engineers WHERE email = $1 FOR UPDATE
+		`, email).Scan(&pendingOffline, &currentCaseID)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 			result = CompletedResult{}
 			return nil
 		case err != nil:
 			return fmt.Errorf("lock engineer: %w", err)
+		}
+		if currentCaseID == nil {
+			result = CompletedResult{}
+			return nil
 		}
 
 		if pendingOffline {

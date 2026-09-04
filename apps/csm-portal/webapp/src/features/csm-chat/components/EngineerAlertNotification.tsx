@@ -36,6 +36,7 @@ import { useDeclineChatSession } from "@features/csm-chat/api/useDeclineChatSess
 import {
   ENGINEER_STATUS_QUERY_KEY,
   useGetEngineerStatus,
+  type EngineerPresence,
 } from "@features/csm-chat/api/useEngineerStatus";
 import type { ChatAlertEvent } from "@features/csm-chat/types/chatAlerts";
 
@@ -93,6 +94,30 @@ export default function EngineerAlertNotification(): JSX.Element | null {
   const declineMutation = useDeclineChatSession();
   const queryClient = useQueryClient();
   const { data: presence } = useGetEngineerStatus();
+
+  // Clears currentCase in the cached presence the instant a session/alert
+  // is locally dismissed (handleComplete/handleDismiss), rather than
+  // waiting for the mutation's own invalidateQueries to trigger a refetch.
+  // Without this, there's a window — between clearing local state here and
+  // that refetch actually resolving — where this query's cached data is
+  // still the OLD value (status BUSY/PENDING, currentCase set), and the
+  // rehydrate effect right below fires on exactly that stale read (its
+  // deps include `presence`, and pending/session just became null),
+  // resurrecting the very session/alert that was just dismissed. That was
+  // the "End Session button comes back, and clicking it again drops you to
+  // Available instead of Offline" bug: the resurrected widget let
+  // handleComplete fire a *second* POST .../complete for the same
+  // already-ended case, and chat-routing-service's Completed() -- now
+  // guarded against this specifically, see its own doc comment -- used to
+  // silently re-derive AVAILABLE/OFFLINE from pending_offline's value
+  // *after* the first call had already reset it. This fixes the cause on
+  // the UI side; the router-level guard fixes it defensively either way.
+  const clearCachedCurrentCase = useCallback((): void => {
+    queryClient.setQueryData<EngineerPresence | undefined>(
+      ENGINEER_STATUS_QUERY_KEY,
+      (prev) => (prev ? { ...prev, currentCase: undefined } : prev),
+    );
+  }, [queryClient]);
 
   // Rehydrates a lost alert/session after a refresh or a remount of this
   // component (it's mounted once in AuthGuard, but a full page reload
@@ -256,7 +281,8 @@ export default function EngineerAlertNotification(): JSX.Element | null {
       }
     }
     setPending(null);
-  }, [pending, declineMutation]);
+    clearCachedCurrentCase();
+  }, [pending, declineMutation, clearCachedCurrentCase]);
 
   const handleSend = useCallback(async (): Promise<void> => {
     const text = messageDraft.trim();
@@ -286,12 +312,13 @@ export default function EngineerAlertNotification(): JSX.Element | null {
     if (!session) return;
     const { caseId, conversationId } = session;
     setSession(null);
+    clearCachedCurrentCase();
     try {
       await completeMutation.mutateAsync({ caseId, conversationId });
     } catch {
       // Best-effort — the widget has already cleared locally either way.
     }
-  }, [session, completeMutation]);
+  }, [session, completeMutation, clearCachedCurrentCase]);
 
   const handleDraftKeyDown = useCallback(
     (e: KeyboardEvent<HTMLDivElement>): void => {
