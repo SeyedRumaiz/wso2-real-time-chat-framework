@@ -219,6 +219,32 @@ All routes below `/route/*` require the `X-Routing-Service-Token` header
 A storage/database error on any `/route/*` call returns `502` — the real
 error is logged server-side (`slog`) and never sent to the caller.
 
+A full OpenAPI 3.0 description of every route above (request/response
+schemas, which fields are required, which endpoints are the temporary
+stand-in ones) lives in [`openapi.yaml`](./openapi.yaml) alongside this
+file.
+
+## Integrating from another service
+
+**The plain HTTP API above is the primary integration surface** — any
+service, in any language, can call it directly with nothing more than the
+base URL and a copy of `ROUTING_SERVICE_TOKEN`. `apps/chat-routing-service/
+sdk-go` (a thin Go client wrapping these same routes) exists purely as a
+convenience for `csm-portal/backend`, today's only real caller — it carries
+no logic of its own, adds no capability the raw API doesn't already have,
+and is optional. A non-Go consumer, or a Go service that would rather not
+take the dependency, should build straight against `openapi.yaml` and the
+[HTTP surface](#http-surface) table instead.
+
+Two things any new consumer should treat as a real contract, not an
+implementation detail: the `X-Routing-Service-Token` header is a static
+server-to-server secret and must never be constructed in, or proxied out
+to, browser-facing code (see [Configuration](#configuration)); and the
+`/route/workitem`, `/route/comment`, and `/route/debug/*` routes are an
+explicitly temporary stand-in (see this repo's `internal/router/
+workitem.go`) — a new integration should confirm with this service's owner
+before depending on their shape.
+
 ## Configuration
 
 Loaded from the environment (a `.env` file is read first if present — see
