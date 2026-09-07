@@ -80,7 +80,13 @@ func main() {
 	defer pool.Close()
 
 	r := router.NewRouter(pool)
-	h := handler.NewRoutingHandler(r)
+
+	// pendingTimeout: how long an engineer can sit PENDING (assigned a case,
+	// not yet accepted) before POST /route/sweep-timeouts reassigns or
+	// requeues that case and takes the unresponsive engineer OFFLINE -- see
+	// internal/router/timeout.go's SweepExpiredPending doc comment.
+	pendingTimeout := envDurationSeconds("PENDING_TIMEOUT_SECONDS", 90)
+	h := handler.NewRoutingHandler(r, pendingTimeout)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /route/escalate", h.Escalate)
@@ -94,6 +100,7 @@ func main() {
 	mux.HandleFunc("POST /route/comment", h.AddComment)
 	mux.HandleFunc("GET /route/debug/workitem/{caseId}", h.DebugWorkItem)
 	mux.HandleFunc("GET /route/debug/state", h.DebugState)
+	mux.HandleFunc("POST /route/sweep-timeouts", h.SweepTimeouts)
 
 	// /health is deliberately outside the InternalToken gate below (an
 	// explicit "GET /health" pattern on topMux takes priority over the
@@ -148,6 +155,20 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envDurationSeconds returns the given environment variable (or defSeconds
+// if unset) as a time.Duration, interpreting the value as a plain whole
+// number of seconds (e.g. "90", not "90s"). Exits the process if set to
+// something else, matching mustPort's fail-fast-at-startup style below.
+func envDurationSeconds(key string, defSeconds int) time.Duration {
+	v := envOrDefault(key, strconv.Itoa(defSeconds))
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs <= 0 {
+		slog.Error("environment variable must be a positive whole number of seconds", "key", key, "value", v)
+		os.Exit(1)
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // mustPort returns the value of the given environment variable (or def if

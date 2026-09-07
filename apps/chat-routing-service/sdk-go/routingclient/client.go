@@ -167,6 +167,19 @@ type AcceptResult struct {
 	Applied bool `json:"applied"`
 }
 
+// TimeoutResult mirrors router.TimeoutResult -- one PENDING engineer's
+// outcome from a call to SweepTimeouts: they'd been assigned a case and
+// never accepted it within chat-routing-service's own configured
+// PENDING_TIMEOUT_SECONDS, so that service reassigned or requeued it on
+// their behalf and took them OFFLINE.
+type TimeoutResult struct {
+	Email        string    `json:"email"`
+	CaseID       string    `json:"caseId"`
+	ReassignedTo string    `json:"reassignedTo,omitempty"`
+	Requeued     bool      `json:"requeued,omitempty"`
+	AssignedCase *CaseInfo `json:"assignedCase,omitempty"`
+}
+
 // do is the shared request/response plumbing for every method below: encode
 // reqBody (if any) as the JSON request body, attach the shared-secret
 // header, and on a 2xx response decode into out (if any). Any non-2xx
@@ -313,6 +326,14 @@ func (c *Client) AddComment(ctx context.Context, caseID, authorEmail, content st
 type PresenceDetail struct {
 	Status      Status    `json:"status"`
 	CurrentCase *CaseInfo `json:"currentCase,omitempty"`
+	// PendingSince is set only when Status is StatusPending -- when this
+	// engineer was assigned their current case. Lets a caller's UI show a
+	// countdown to when SweepTimeouts will reassign it.
+	PendingSince *time.Time `json:"pendingSince,omitempty"`
+	// PendingTimeoutSeconds is chat-routing-service's own configured
+	// PENDING_TIMEOUT_SECONDS -- always present, a constant rather than
+	// per-engineer state.
+	PendingTimeoutSeconds int `json:"pendingTimeoutSeconds"`
 }
 
 // GetPresence calls GET /route/presence/{email}, returning StatusOffline
@@ -328,4 +349,20 @@ func (c *Client) GetPresence(ctx context.Context, email string) (PresenceDetail,
 		out.Status = StatusOffline
 	}
 	return out, nil
+}
+
+// SweepTimeouts calls POST /route/sweep-timeouts, asking the routing
+// service to reassign or requeue any case whose assigned engineer has been
+// PENDING (assigned, not yet accepted) past that service's own configured
+// PENDING_TIMEOUT_SECONDS. Meant to be polled periodically by whichever
+// caller owns delivering the result to the newly-assigned engineer (see
+// apps/csm-portal/backend/internal/handler's ChatHandler.
+// StartTimeoutSweeper) -- this service never pushes anything itself, see
+// this package's own "Synchronous HTTP only" design note above.
+func (c *Client) SweepTimeouts(ctx context.Context) ([]TimeoutResult, error) {
+	var out struct {
+		Results []TimeoutResult `json:"results"`
+	}
+	err := c.do(ctx, http.MethodPost, "/route/sweep-timeouts", nil, &out)
+	return out.Results, err
 }

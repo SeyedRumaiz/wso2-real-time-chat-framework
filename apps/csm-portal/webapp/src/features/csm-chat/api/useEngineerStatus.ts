@@ -46,12 +46,29 @@ export interface EngineerPresence {
   // it, an engineer who's genuinely still PENDING/BUSY server-side has
   // nothing left in the UI to act on.
   currentCase?: EngineerCurrentCase;
+  // ISO 8601 — set only when status is PENDING: when this engineer was
+  // assigned currentCase. Lets EngineerAlertNotification resume an
+  // accurate accept-countdown after a refresh instead of restarting it
+  // from the full duration.
+  pendingSince?: string;
+  // chat-routing-service's configured PENDING_TIMEOUT_SECONDS — always
+  // present (a constant, not per-engineer state), used as the countdown's
+  // total duration.
+  pendingTimeoutSeconds: number;
 }
 
 // Exported so other mutations that change presence server-side as a side
 // effect (ending or declining a session) can invalidate it and pick up the
 // resulting status, instead of leaving this query's cache stale.
 export const ENGINEER_STATUS_QUERY_KEY = ["engineer-status"] as const;
+
+// Fallback only — used for the brief window before this query has ever
+// resolved (or if it fails and falls back to the OFFLINE default below).
+// Once a real response comes back, its own pendingTimeoutSeconds always
+// wins. Matches chat-routing-service's own PENDING_TIMEOUT_SECONDS default
+// (see that service's .env.example) — keep the two in sync if that default
+// ever changes.
+export const DEFAULT_PENDING_TIMEOUT_SECONDS = 90;
 
 /**
  * Reads the authenticated engineer's current live-chat-routing presence:
@@ -78,9 +95,14 @@ export function useGetEngineerStatus(): UseQueryResult<EngineerPresence, Error> 
     queryFn: async () => {
       try {
         const result = await api.get<EngineerPresence>("/engineers/me/status");
-        return { status: result?.status ?? "OFFLINE", currentCase: result?.currentCase };
+        return {
+          status: result?.status ?? "OFFLINE",
+          currentCase: result?.currentCase,
+          pendingSince: result?.pendingSince,
+          pendingTimeoutSeconds: result?.pendingTimeoutSeconds ?? DEFAULT_PENDING_TIMEOUT_SECONDS,
+        };
       } catch {
-        return { status: "OFFLINE" };
+        return { status: "OFFLINE", pendingTimeoutSeconds: DEFAULT_PENDING_TIMEOUT_SECONDS };
       }
     },
     retry: false,

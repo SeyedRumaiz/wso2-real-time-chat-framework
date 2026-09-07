@@ -19,6 +19,7 @@ import {
   Button,
   CircularProgress,
   IconButton,
+  LinearProgress,
   Paper,
   Stack,
   TextField,
@@ -29,6 +30,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { BackendApiError } from "@api/backend/client";
 import { useIdTokenClaims } from "@hooks/useIdTokenClaims";
 import { useChatAlertsStream } from "@features/csm-chat/api/useChatAlertsStream";
+import { DEFAULT_PENDING_TIMEOUT_SECONDS } from "@features/csm-chat/api/useEngineerStatus";
 import { useAcceptChatSession } from "@features/csm-chat/api/useAcceptChatSession";
 import { useSendChatMessage } from "@features/csm-chat/api/useSendChatMessage";
 import { useCompleteChatSession } from "@features/csm-chat/api/useCompleteChatSession";
@@ -48,6 +50,11 @@ type PendingAlert = {
   customerEmail?: string;
   customerName?: string;
   message?: string;
+  // ISO 8601 -- when this engineer was assigned this case (from the SSE
+  // event's own timestamp for a fresh assignment, or from GetPresence's
+  // pendingSince when rehydrating after a refresh). Drives the accept-
+  // countdown below.
+  assignedAt: string;
 };
 
 type LiveChatMessage = {
@@ -94,6 +101,29 @@ export default function EngineerAlertNotification(): JSX.Element | null {
   const declineMutation = useDeclineChatSession();
   const queryClient = useQueryClient();
   const { data: presence } = useGetEngineerStatus();
+
+  // Ticks once a second, only while a pending alert is showing, to drive
+  // the accept-countdown rendered below -- see PendingAlert.assignedAt and
+  // presence.pendingTimeoutSeconds (chat-routing-service's configured
+  // PENDING_TIMEOUT_SECONDS). Purely a UI countdown: the real timeout is
+  // enforced server-side on its own poll cadence (see that service's
+  // SweepExpiredPending and csm-portal/backend's StartTimeoutSweeper), so
+  // this can briefly read a few seconds past zero before the case_timed_
+  // out/session_accepted event for it actually arrives and clears it.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!pending) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [pending]);
+
+  const pendingTimeoutSeconds = presence?.pendingTimeoutSeconds ?? DEFAULT_PENDING_TIMEOUT_SECONDS;
+  const remainingSeconds = pending
+    ? Math.max(
+        0,
+        pendingTimeoutSeconds - Math.floor((now - new Date(pending.assignedAt).getTime()) / 1000),
+      )
+    : null;
 
   // Clears currentCase in the cached presence the instant a session/alert
   // is locally dismissed (handleComplete/handleDismiss), rather than
@@ -153,6 +183,11 @@ export default function EngineerAlertNotification(): JSX.Element | null {
       customerEmail: cc.customerEmail,
       customerName: cc.customerName,
       message: cc.message,
+      // Falls back to "now" only if the backend somehow omitted
+      // pendingSince for a PENDING engineer, which SweepExpiredPending's
+      // own status check should make impossible -- this just avoids a
+      // broken/NaN countdown rather than silently trusting bad data.
+      assignedAt: presence.pendingSince ?? new Date().toISOString(),
     });
   }, [pending, session, presence]);
 
@@ -182,6 +217,7 @@ export default function EngineerAlertNotification(): JSX.Element | null {
               customerEmail: event.customerEmail,
               customerName: event.customerName,
               message: event.message,
+              assignedAt: event.timestamp,
             };
           });
           break;
@@ -224,6 +260,17 @@ export default function EngineerAlertNotification(): JSX.Element | null {
           setPending((current) =>
             current && current.caseId === event.caseId ? null : current,
           );
+          break;
+        }
+        case "case_timed_out": {
+          // We never accepted this one in time -- chat-routing-service
+          // already reassigned/requeued it and took us OFFLINE server-side
+          // (see that service's SweepExpiredPending). Only ever applies to
+          // a still-pending alert, never an active session.
+          setPending((current) =>
+            current && current.caseId === event.caseId ? null : current,
+          );
+          queryClient.invalidateQueries({ queryKey: ENGINEER_STATUS_QUERY_KEY });
           break;
         }
         default:
@@ -364,6 +411,25 @@ export default function EngineerAlertNotification(): JSX.Element | null {
               </Typography>
             </IconButton>
           </Stack>
+          {remainingSeconds !== null && (
+            <Box sx={{ mt: 1 }}>
+              <LinearProgress
+                variant="determinate"
+                value={Math.min(100, (remainingSeconds / pendingTimeoutSeconds) * 100)}
+                color={remainingSeconds <= 10 ? "warning" : "primary"}
+                sx={{ height: 4, borderRadius: 2 }}
+              />
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ mt: 0.5, display: "block" }}
+              >
+                {remainingSeconds > 0
+                  ? `Auto-reassigns in ${remainingSeconds}s if not accepted`
+                  : "Reassigning any moment\u2026"}
+              </Typography>
+            </Box>
+          )}
           <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
             {pending.customerName || pending.customerEmail || "A customer"} is
             asking to talk to a live engineer.

@@ -212,6 +212,31 @@ paths:
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
+  /route/sweep-timeouts:
+    post:
+      tags: [routing]
+      summary: >-
+        Reassign or requeue any case whose assigned engineer has been
+        PENDING (assigned, not yet accepted) past this service's own
+        configured PENDING_TIMEOUT_SECONDS, and take each such engineer
+        OFFLINE. Meant to be polled periodically by a caller that owns
+        delivering the result somewhere (csm-portal/backend does this every
+        ENGINEER_TIMEOUT_SWEEP_INTERVAL_SECONDS) -- this service does not
+        push anything on its own. Safe to call as often as you like; a
+        sweep with nothing expired returns an empty results array.
+      operationId: sweepTimeouts
+      responses:
+        "200":
+          description: One entry per engineer who timed out this sweep (may be empty).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SweepTimeoutsResponse'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "502":
+          $ref: '#/components/responses/StorageUnavailable'
+
   /route/presence/{email}:
     get:
       tags: [routing]
@@ -524,6 +549,35 @@ components:
           type: boolean
           description: False means the accept was stale — the case was already declined/reassigned/requeued out from under this engineer, or they never held it.
 
+    TimeoutResult:
+      type: object
+      description: >-
+        One engineer's outcome from a timeout sweep -- exactly one of
+        reassignedTo (with assignedCase) or requeued applies. The engineer
+        named in email is always taken OFFLINE as part of this.
+      properties:
+        email:
+          type: string
+          format: email
+        caseId:
+          type: string
+        reassignedTo:
+          type: string
+          description: Set when another available engineer was found.
+        requeued:
+          type: boolean
+          description: Set when nobody was available and the case went back to the front of the queue.
+        assignedCase:
+          $ref: '#/components/schemas/CaseInfo'
+
+    SweepTimeoutsResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeoutResult'
+
     PresenceDetailResponse:
       type: object
       properties:
@@ -531,6 +585,13 @@ components:
           $ref: '#/components/schemas/Status'
         currentCase:
           $ref: '#/components/schemas/CaseInfo'
+        pendingSince:
+          type: string
+          format: date-time
+          description: Set only when status is PENDING -- when this engineer was assigned their current case.
+        pendingTimeoutSeconds:
+          type: integer
+          description: This service's configured PENDING_TIMEOUT_SECONDS -- always present, not per-engineer state.
 
     WorkItemRequest:
       type: object

@@ -130,6 +130,7 @@ own-case check); the only thing that separates them is `Router.Accept`.
 | mid-session (`PENDING` or `BUSY`, `current_case` set) | `OFFLINE` requested | **deferred** — `pending_offline` is set, engineer stays `PENDING`/`BUSY` until the session ends |
 | mid-session | `AVAILABLE` requested | just clears `pending_offline` if it was set; the session itself is untouched (one dedicated session, can't free early) |
 | `PENDING` on `caseId` | `POST /route/accept {email, caseId}` | flips to `BUSY` — the engineer has now actually accepted. A stale accept (already declined/reassigned/accepted, or a different `caseId`) reports `{applied:false}` rather than erroring — see `Router.Accept`'s own doc comment. |
+| `PENDING` on `caseId`, too long | (no explicit request — a periodic `POST /route/sweep-timeouts` call finds it) | the engineer is taken `OFFLINE` (not re-queued as available — they didn't respond, so immediately handing them another case would likely repeat the timeout) and the case is reassigned to the next available engineer, or pushed back onto the front of the queue if nobody's free — same outcome shape as a `Decline`, just triggered by elapsed time instead of the engineer's own click |
 
 **On session completion:** if `pending_offline` was set, the engineer goes
 straight to `OFFLINE` and does **not** rejoin the pool or take a queued
@@ -212,8 +213,9 @@ All routes below `/route/*` require the `X-Routing-Service-Token` header
 | `POST` | `/route/completed` | `{email}` | `{removed, rejoined, assignedCase?}` |
 | `POST` | `/route/decline` | `{email, caseId}` | `{reassignedTo?, requeued?}` |
 | `POST` | `/route/accept` | `{email, caseId}` | `{applied}` — `PENDING` → `BUSY`; `false` if stale (see [Presence state machine](#presence-state-machine)) |
-| `GET` | `/route/presence/{email}` | — | `{status, currentCase?}` (defaults to `OFFLINE`, no case, for an unseen engineer; `currentCase` is set when `PENDING` or `BUSY`) |
+| `GET` | `/route/presence/{email}` | — | `{status, currentCase?, pendingSince?, pendingTimeoutSeconds}` (defaults to `OFFLINE`, no case, for an unseen engineer; `currentCase`/`pendingSince` set when `PENDING`; `currentCase` also set when `BUSY`; `pendingTimeoutSeconds` always present) |
 | `GET` | `/route/debug/state` | — | full dump of `engineers` (incl. today's chat count) + `escalation_queue` — verification only |
+| `POST` | `/route/sweep-timeouts` | — | reassigns/requeues any case whose engineer has been `PENDING` past `PENDING_TIMEOUT_SECONDS`, taking them `OFFLINE` — `{results: [...]}`, polled periodically by `csm-portal/backend` (see [Presence state machine](#presence-state-machine)) |
 | `GET` | `/health` | — | `200 OK` |
 
 A storage/database error on any `/route/*` call returns `502` — the real
@@ -254,6 +256,7 @@ Loaded from the environment (a `.env` file is read first if present — see
 |---|---|
 | `ROUTING_SERVICE_PORT` | bare port number, default `9096` |
 | `ROUTING_SERVICE_TOKEN` | shared secret; must match `csm-portal/backend`'s value |
+| `PENDING_TIMEOUT_SECONDS` | how long (seconds) an engineer can sit `PENDING` before `POST /route/sweep-timeouts` reassigns/requeues their case and takes them `OFFLINE`; default `90` |
 | `DB_HOST`, `DB_PORT`, `DB_NAME` | **point these at the same database `entity-service` uses** — this service's tables live in their own Postgres schema (see [Data model](#data-model)), not a separate database, so there's nothing dedicated to stand up here |
 | `DB_USER`, `DB_PASSWORD` | credentials for that database — reusing `entity-service`'s own user is fine for local dev; a narrower-scoped role needs the grants noted in [Running locally](#running-locally) |
 | `DB_SSLMODE` | default `disable` (local dev) |

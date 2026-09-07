@@ -135,6 +135,10 @@ type routingService interface {
 	Decline(ctx context.Context, email, caseID string) (routingclient.DeclineResult, error)
 	Accept(ctx context.Context, email, caseID string) (routingclient.AcceptResult, error)
 	GetPresence(ctx context.Context, email string) (routingclient.PresenceDetail, error)
+	// SweepTimeouts is polled periodically by ChatHandler.StartTimeoutSweeper
+	// (see that method's doc comment) -- not called from any HTTP handler in
+	// this file directly.
+	SweepTimeouts(ctx context.Context) ([]routingclient.TimeoutResult, error)
 	// CreateWorkItem and AddComment are LOCAL STAND-IN persistence calls
 	// (see routingclient.Client.CreateWorkItem's doc comment and the
 	// project's chat-persistence-mapping-plan.md) -- they exist only until

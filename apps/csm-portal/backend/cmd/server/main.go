@@ -154,6 +154,13 @@ func main() {
 	})
 	chatHandler := handler.NewChatHandler(customerEntityClient, engineerHub, chatNotifyClient, routingClient)
 
+	// engineerTimeoutSweepInterval: how often this backend polls
+	// chat-routing-service for engineers who timed out on a PENDING case --
+	// independent of that service's own PENDING_TIMEOUT_SECONDS (the
+	// staleness threshold), this is just the polling cadence. See
+	// handler.ChatHandler.StartTimeoutSweeper.
+	engineerTimeoutSweepInterval := envDurationSeconds("ENGINEER_TIMEOUT_SWEEP_INTERVAL_SECONDS", 15)
+
 	dashboardHandler := handler.NewDashboardHandler(customerEntityClient)
 	accountHandler := handler.NewAccountHandler(customerEntityClient)
 	projectHandler := handler.NewProjectHandler(customerEntityClient)
@@ -307,6 +314,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	go chatHandler.StartTimeoutSweeper(ctx, engineerTimeoutSweepInterval)
 
 	addr := ":" + mustPort("PORT", "8080")
 
@@ -562,6 +571,20 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envDurationSeconds returns the given environment variable (or defSeconds
+// if unset) as a time.Duration, interpreting the value as a plain whole
+// number of seconds (e.g. "15", not "15s"). Exits the process if set to
+// something else, matching mustPort's fail-fast-at-startup style below.
+func envDurationSeconds(key string, defSeconds int) time.Duration {
+	v := envOrDefault(key, strconv.Itoa(defSeconds))
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs <= 0 {
+		slog.Error("environment variable must be a positive whole number of seconds", "key", key, "value", v)
+		os.Exit(1)
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // newReplicaID returns a stable identifier for this process's Kafka

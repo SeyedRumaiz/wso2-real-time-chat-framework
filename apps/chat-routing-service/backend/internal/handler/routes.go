@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/wso2-open-operations/cs-tools/apps/chat-routing-service/backend/internal/router"
 )
@@ -34,12 +35,17 @@ const maxBodyBytes = 64 << 10 // 64 KiB
 
 // RoutingHandler adapts HTTP requests to router.Router calls.
 type RoutingHandler struct {
-	router *router.Router
+	router         *router.Router
+	pendingTimeout time.Duration
 }
 
-// NewRoutingHandler constructs a RoutingHandler over r.
-func NewRoutingHandler(r *router.Router) *RoutingHandler {
-	return &RoutingHandler{router: r}
+// NewRoutingHandler constructs a RoutingHandler over r. pendingTimeout is
+// how long an engineer can sit PENDING (assigned, not yet accepted) before
+// SweepTimeouts reassigns/requeues their case -- see
+// router.Router.SweepExpiredPending and cmd/server/main.go's
+// PENDING_TIMEOUT_SECONDS.
+func NewRoutingHandler(r *router.Router, pendingTimeout time.Duration) *RoutingHandler {
+	return &RoutingHandler{router: r, pendingTimeout: pendingTimeout}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -244,7 +250,18 @@ func (h *RoutingHandler) GetPresence(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		Status      router.Status    `json:"status"`
 		CurrentCase *router.CaseInfo `json:"currentCase,omitempty"`
-	}{Status: detail.Status, CurrentCase: detail.CurrentCase})
+		// PendingSince/PendingTimeoutSeconds let a caller's UI show a
+		// countdown to when an unaccepted PENDING case gets reassigned (see
+		// router.Router.SweepExpiredPending) -- PendingSince is nil unless
+		// Status is PENDING; PendingTimeoutSeconds is this service's own
+		// configured threshold, always included since it's a constant, not
+		// per-engineer state.
+		PendingSince          *time.Time `json:"pendingSince,omitempty"`
+		PendingTimeoutSeconds int        `json:"pendingTimeoutSeconds"`
+	}{
+		Status: detail.Status, CurrentCase: detail.CurrentCase,
+		PendingSince: detail.PendingSince, PendingTimeoutSeconds: int(h.pendingTimeout.Seconds()),
+	})
 }
 
 // workItemRequest is the body for POST /route/workitem -- see
@@ -332,4 +349,25 @@ func (h *RoutingHandler) DebugState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, state)
+}
+
+// SweepTimeouts handles POST /route/sweep-timeouts. Called periodically by
+// csm-portal/backend (see that service's ChatHandler.StartTimeoutSweeper)
+// rather than run as this process's own ticker, so the one component that
+// already owns the engineer SSE hub is also the one deciding when to look
+// and delivering whatever this returns -- see router.Router.
+// SweepExpiredPending's doc comment for the full reassign/requeue/OFFLINE
+// behavior this triggers for any engineer who's been PENDING too long.
+func (h *RoutingHandler) SweepTimeouts(w http.ResponseWriter, r *http.Request) {
+	results, err := h.router.SweepExpiredPending(r.Context(), h.pendingTimeout)
+	if err != nil {
+		writeStorageError(w, "sweep-timeouts", err)
+		return
+	}
+	if results == nil {
+		results = []router.TimeoutResult{}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Results []router.TimeoutResult `json:"results"`
+	}{Results: results})
 }

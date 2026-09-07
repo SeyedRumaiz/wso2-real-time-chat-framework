@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -513,6 +514,13 @@ func (r *Router) Accept(ctx context.Context, email, caseID string) (AcceptResult
 type PresenceDetail struct {
 	Status      Status
 	CurrentCase *CaseInfo
+	// PendingSince is when this engineer entered PENDING -- the same
+	// updated_at column SweepExpiredPending measures staleness against
+	// (see timeout.go) -- nil unless Status is PENDING. Lets a caller
+	// (the frontend's pending-alert countdown) compute how much longer
+	// until a timeout sweep reassigns this case even after losing local
+	// timer state to a refresh or a closed tab.
+	PendingSince *time.Time
 }
 
 // GetPresence returns email's current status and, when PENDING or BUSY,
@@ -523,9 +531,10 @@ func (r *Router) GetPresence(ctx context.Context, email string) (PresenceDetail,
 	var (
 		status      Status
 		currentCase []byte
+		updatedAt   time.Time
 	)
-	err := r.db.QueryRow(ctx, `SELECT status, current_case FROM engineers WHERE email = $1`, email).
-		Scan(&status, &currentCase)
+	err := r.db.QueryRow(ctx, `SELECT status, current_case, updated_at FROM engineers WHERE email = $1`, email).
+		Scan(&status, &currentCase, &updatedAt)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return PresenceDetail{Status: StatusOffline}, nil
@@ -533,6 +542,10 @@ func (r *Router) GetPresence(ctx context.Context, email string) (PresenceDetail,
 		return PresenceDetail{}, fmt.Errorf("router: get presence: %w", err)
 	}
 	detail := PresenceDetail{Status: status}
+	if status == StatusPending {
+		since := updatedAt
+		detail.PendingSince = &since
+	}
 	if currentCase != nil {
 		var c CaseInfo
 		if err := json.Unmarshal(currentCase, &c); err != nil {
