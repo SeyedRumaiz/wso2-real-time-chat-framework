@@ -37,8 +37,8 @@ import (
 // parameter is rejected by libpq/pgx's URI parser, and the documented
 // "options=-c ..." workaround needs char-for-char correct percent-encoding
 // that isn't worth the risk here) so every unqualified table name in
-// internal/router's queries (engineers, escalation_queue, ...) resolves
-// here automatically, without schema-qualifying each query by hand.
+// internal/router's queries (engineers, chat_queue, chat_conversation, ...)
+// resolves here automatically, without schema-qualifying each query by hand.
 const Schema = "chat_routing"
 
 // DBConfig holds the PostgreSQL connection settings this service uses --

@@ -17,23 +17,30 @@
 // Package router implements the engineer-availability/queue state machine
 // for the live-engineer-chat routing feature: engineers are AVAILABLE,
 // PENDING (assigned, not yet accepted), BUSY (accepted, in-progress), or
-// OFFLINE. An escalation is assigned by priority -- first to the
-// engineer that customer was most recently assigned to, if that engineer
-// is free right now, otherwise to whichever AVAILABLE engineer has taken
-// the fewest chats today (ties broken by who's been AVAILABLE longest) --
-// or queued FIFO if nobody qualifies; a completed session drains the
-// queue. See Router.Escalate's own doc comment for the full priority order
-// and Router's for the rest of the state machine.
+// OFFLINE. An escalation is assigned to whichever AVAILABLE engineer has
+// taken the fewest chats today (ties broken by who's been AVAILABLE
+// longest), or queued FIFO if nobody qualifies; a completed session drains
+// the queue. See Router.Escalate's own doc comment for the full assignment
+// logic and Router's for the rest of the state machine. A per-customer
+// "sticky" preference (try to reconnect a customer to whoever last handled
+// them) used to be tried first -- dropped per the 2026-09-07 DB schema
+// review as fully derivable, unnecessary state (see migrations/000013's
+// own doc comment).
+//
+// Engineers are identified by their IdP "userid" claim (see migrations/
+// 000014_rename_engineer_status_table) -- this package stores no email of
+// its own; a caller that needs one already has it from its own
+// authenticated session (see csm-portal/backend's internal/middleware.
+// UserInfo).
 //
 // Backed by PostgreSQL (see this service's migrations/ and internal/db) --
-// engineer presence, the per-customer sticky-engineer record, and the
-// escalation queue all survive a restart and, since every state transition
-// is a transaction against a shared database rather than an in-process
-// mutex, this is also safe for multiple replicas of this service to run
-// against the same database concurrently. The one limitation that predates
-// this and remains: no timeout/reassignment if an assigned engineer never
-// accepts or goes unreachable -- that stays a prototype gap, unrelated to
-// where the state lives.
+// engineer presence and the escalation queue both survive a restart and,
+// since every state transition is a transaction against a shared database
+// rather than an in-process mutex, this is also safe for multiple replicas
+// of this service to run against the same database concurrently. The one
+// limitation that predates this and remains: no timeout/reassignment if an
+// assigned engineer never accepts or goes unreachable -- that stays a
+// prototype gap, unrelated to where the state lives.
 package router
 
 // Status is an engineer's current availability.
@@ -61,7 +68,7 @@ const (
 // carried through Escalate/queueing/Decline verbatim, this service never
 // interprets these fields itself. Persisted as a JSONB blob (see
 // migrations/000001_create_engineers.up.sql and
-// 000002_create_escalation_queue.up.sql) rather than normalized columns --
+// 000002_create_escalation_queue.up.sql, renamed to chat_queue by 000008) rather than normalized columns --
 // this service never queries by any field other than CaseID, and a blob
 // keeps it a one-file change if csm-portal/backend ever adds a field.
 type CaseInfo struct {

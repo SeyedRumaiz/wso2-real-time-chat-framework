@@ -32,10 +32,12 @@ import (
 // way as an explicit Decline from the caller's perspective, just triggered
 // by a background sweep instead of the engineer's own click.
 type TimeoutResult struct {
-	// Email is the engineer who was PENDING past the timeout -- taken
+	// UserID is the engineer who was PENDING past the timeout -- taken
 	// OFFLINE as a side effect (see SweepExpiredPending's doc comment for
-	// why OFFLINE rather than AVAILABLE).
-	Email        string    `json:"email"`
+	// why OFFLINE rather than AVAILABLE). See migrations/
+	// 000014_rename_engineer_status_table for why this is a user ID rather
+	// than an email.
+	UserID       string    `json:"userId"`
 	CaseID       string    `json:"caseId"`
 	ReassignedTo string    `json:"reassignedTo,omitempty"`
 	Requeued     bool      `json:"requeued,omitempty"`
@@ -45,22 +47,22 @@ type TimeoutResult struct {
 // pendingCandidate is one row from SweepExpiredPending's initial, unlocked
 // scan -- re-verified under lock by timeoutOne before anything changes.
 type pendingCandidate struct {
-	email  string
+	userID string
 	caseID string
 }
 
 // SweepExpiredPending finds every engineer who has been PENDING on the
 // same case for at least timeout and treats each one exactly like an
 // explicit Decline (see Router.Decline: reassign to the next available
-// engineer, excluding this one, or push back onto the FRONT of the queue),
-// except that the unresponsive engineer is taken OFFLINE rather than
-// AVAILABLE or re-queued-as-available: they didn't respond to the original
-// alert, so immediately handing them (or keeping them eligible for)
-// another case would likely just repeat the same timeout. Going OFFLINE
-// requires them to deliberately set themselves AVAILABLE again before
-// they're routed anything else. A deliberate, conservative default --
-// straightforward to change to AVAILABLE here if that turns out to be too
-// aggressive in practice.
+// engineer, excluding this one, or flip the case's chat_queue row back to
+// WAITING_FOR_ENGINEER), except that the unresponsive engineer is taken
+// OFFLINE rather than AVAILABLE or re-queued-as-available: they didn't
+// respond to the original alert, so immediately handing them (or keeping
+// them eligible for) another case would likely just repeat the same
+// timeout. Going OFFLINE requires them to deliberately set themselves
+// AVAILABLE again before they're routed anything else. A deliberate,
+// conservative default -- straightforward to change to AVAILABLE here if
+// that turns out to be too aggressive in practice.
 //
 // Meant to be called periodically by a caller that also owns delivering
 // the result somewhere (see apps/csm-portal/backend's
@@ -73,8 +75,9 @@ type pendingCandidate struct {
 // moves forward.
 func (r *Router) SweepExpiredPending(ctx context.Context, timeout time.Duration) ([]TimeoutResult, error) {
 	rows, err := r.db.Query(ctx, `
-		SELECT email, current_case_id FROM engineers
-		WHERE status = 'PENDING' AND updated_at < now() - make_interval(secs => $1)
+		SELECT user_id, current_case_id FROM cs_engineer_status
+		WHERE chat_status = 'BUSY' AND accepted_at IS NULL
+		  AND updated_at < now() - make_interval(secs => $1)
 	`, timeout.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("router: scan expired pending: %w", err)
@@ -82,7 +85,7 @@ func (r *Router) SweepExpiredPending(ctx context.Context, timeout time.Duration)
 	var candidates []pendingCandidate
 	for rows.Next() {
 		var c pendingCandidate
-		if err := rows.Scan(&c.email, &c.caseID); err != nil {
+		if err := rows.Scan(&c.userID, &c.caseID); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("router: scan expired pending row: %w", err)
 		}
@@ -94,9 +97,9 @@ func (r *Router) SweepExpiredPending(ctx context.Context, timeout time.Duration)
 
 	var results []TimeoutResult
 	for _, c := range candidates {
-		result, err := r.timeoutOne(ctx, c.email, c.caseID, timeout)
+		result, err := r.timeoutOne(ctx, c.userID, c.caseID, timeout)
 		if err != nil {
-			return results, fmt.Errorf("router: time out %s on %s: %w", c.email, c.caseID, err)
+			return results, fmt.Errorf("router: time out %s on %s: %w", c.userID, c.caseID, err)
 		}
 		if result != nil {
 			results = append(results, *result)
@@ -111,7 +114,7 @@ func (r *Router) SweepExpiredPending(ctx context.Context, timeout time.Duration)
 // SweepExpiredPending's own scan is unlocked, so the engineer may have
 // already accepted, declined, or been reassigned since -- any of those
 // makes this a no-op (nil, nil) instead of double-processing them.
-func (r *Router) timeoutOne(ctx context.Context, email, caseID string, timeout time.Duration) (*TimeoutResult, error) {
+func (r *Router) timeoutOne(ctx context.Context, userID, caseID string, timeout time.Duration) (*TimeoutResult, error) {
 	var result *TimeoutResult
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
 		var (
@@ -119,18 +122,19 @@ func (r *Router) timeoutOne(ctx context.Context, email, caseID string, timeout t
 			currentCaseID *string
 			currentCase   []byte
 			updatedAt     time.Time
+			acceptedAt    *time.Time
 		)
 		err := tx.QueryRow(ctx, `
-			SELECT status, current_case_id, current_case, updated_at
-			FROM engineers WHERE email = $1 FOR UPDATE
-		`, email).Scan(&status, &currentCaseID, &currentCase, &updatedAt)
+			SELECT chat_status, current_case_id, current_case, updated_at, accepted_at
+			FROM cs_engineer_status WHERE user_id = $1 FOR UPDATE
+		`, userID).Scan(&status, &currentCaseID, &currentCase, &updatedAt, &acceptedAt)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 			return nil
 		case err != nil:
 			return fmt.Errorf("lock engineer: %w", err)
 		}
-		if status != StatusPending || currentCaseID == nil || *currentCaseID != caseID || time.Since(updatedAt) < timeout {
+		if !isPendingAccept(status, currentCaseID != nil, acceptedAt) || currentCaseID == nil || *currentCaseID != caseID || time.Since(updatedAt) < timeout {
 			return nil
 		}
 
@@ -140,13 +144,23 @@ func (r *Router) timeoutOne(ctx context.Context, email, caseID string, timeout t
 		}
 
 		if _, err := tx.Exec(ctx, `
-			UPDATE engineers
-			SET status = 'OFFLINE', pending_offline = false,
+			UPDATE cs_engineer_status
+			SET chat_status = 'OFFLINE', pending_offline = false, accepted_at = NULL,
 			    current_case_id = NULL, current_case = NULL,
 			    available_since = NULL, updated_at = now()
-			WHERE email = $1
-		`, email); err != nil {
+			WHERE user_id = $1
+		`, userID); err != nil {
 			return fmt.Errorf("clear timed-out session: %w", err)
+		}
+
+		// Audit trail (see migrations/000009's own doc comment, and
+		// migrations/000014's rename of this table's columns): userID's
+		// ping on this conversation is now settled as TIMED_OUT.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO chat_queue_engineer_assignment (conversation_id, engineer_id, status)
+			VALUES ($1, $2, 'TIMED_OUT')
+		`, timedOut.ConversationID, userID); err != nil {
+			return fmt.Errorf("record timeout outcome: %w", err)
 		}
 
 		timedOutJSON, err := json.Marshal(timedOut)
@@ -154,7 +168,7 @@ func (r *Router) timeoutOne(ctx context.Context, email, caseID string, timeout t
 			return fmt.Errorf("marshal timed-out case: %w", err)
 		}
 
-		candidate, ok, err := popAvailableEngineer(ctx, tx, email)
+		candidate, ok, err := popAvailableEngineer(ctx, tx, userID)
 		if err != nil {
 			return err
 		}
@@ -163,14 +177,14 @@ func (r *Router) timeoutOne(ctx context.Context, email, caseID string, timeout t
 				return err
 			}
 			assigned := timedOut
-			result = &TimeoutResult{Email: email, CaseID: caseID, ReassignedTo: candidate, AssignedCase: &assigned}
+			result = &TimeoutResult{UserID: userID, CaseID: caseID, ReassignedTo: candidate, AssignedCase: &assigned}
 			return nil
 		}
 
-		if _, err := enqueueCase(ctx, tx, timedOut, timedOutJSON, true); err != nil {
+		if err := requeueWaiting(ctx, tx, timedOut.ConversationID); err != nil {
 			return err
 		}
-		result = &TimeoutResult{Email: email, CaseID: caseID, Requeued: true}
+		result = &TimeoutResult{UserID: userID, CaseID: caseID, Requeued: true}
 		return nil
 	})
 	if err != nil {

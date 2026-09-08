@@ -94,7 +94,7 @@ func main() {
 	mux.HandleFunc("POST /route/completed", h.Completed)
 	mux.HandleFunc("POST /route/decline", h.Decline)
 	mux.HandleFunc("POST /route/accept", h.Accept)
-	mux.HandleFunc("GET /route/presence/{email}", h.GetPresence)
+	mux.HandleFunc("GET /route/presence/{userId}", h.GetPresence)
 	// Local stand-in persistence endpoints -- see internal/router/workitem.go.
 	mux.HandleFunc("POST /route/workitem", h.CreateWorkItem)
 	mux.HandleFunc("POST /route/comment", h.AddComment)

@@ -124,16 +124,15 @@ func (h *RoutingHandler) Escalate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// presenceRequest is the body for POST /route/presence. EngineerID is the
+// presenceRequest is the body for POST /route/presence. UserID is the
 // IdP's stable per-account "userid" claim (see internal/router.Router.
-// SetPresence and migrations/000004) -- required so a first-time presence
-// update can create the engineer's row; ignored (not an error) once that
-// row already exists, since engineer_id never changes for an established
-// email.
+// SetPresence and migrations/000014_rename_engineer_status_table) -- this
+// service's cs_engineer_status table is keyed by it directly, so unlike
+// before that migration no separate identifier is needed to create a
+// first-contact row.
 type presenceRequest struct {
-	Email      string `json:"email"`
-	EngineerID string `json:"engineerId"`
-	Status     string `json:"status"`
+	UserID string `json:"userId"`
+	Status string `json:"status"`
 }
 
 // SetPresence handles POST /route/presence.
@@ -142,12 +141,12 @@ func (h *RoutingHandler) SetPresence(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if req.Email == "" || req.EngineerID == "" || !isValidStatus(req.Status) {
-		writeError(w, http.StatusBadRequest, "email, engineerId, and a valid status (AVAILABLE|OFFLINE) are required.")
+	if req.UserID == "" || !isValidStatus(req.Status) {
+		writeError(w, http.StatusBadRequest, "userId and a valid status (AVAILABLE|OFFLINE) are required.")
 		return
 	}
 
-	result, err := h.router.SetPresence(r.Context(), req.Email, req.EngineerID, router.Status(req.Status))
+	result, err := h.router.SetPresence(r.Context(), req.UserID, router.Status(req.Status))
 	if err != nil {
 		writeStorageError(w, "presence", err)
 		return
@@ -157,7 +156,7 @@ func (h *RoutingHandler) SetPresence(w http.ResponseWriter, r *http.Request) {
 
 // completedRequest is the body for POST /route/completed.
 type completedRequest struct {
-	Email string `json:"email"`
+	UserID string `json:"userId"`
 }
 
 // Completed handles POST /route/completed.
@@ -166,12 +165,12 @@ func (h *RoutingHandler) Completed(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if req.Email == "" {
-		writeError(w, http.StatusBadRequest, "email is required.")
+	if req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "userId is required.")
 		return
 	}
 
-	result, err := h.router.Completed(r.Context(), req.Email)
+	result, err := h.router.Completed(r.Context(), req.UserID)
 	if err != nil {
 		writeStorageError(w, "completed", err)
 		return
@@ -181,7 +180,7 @@ func (h *RoutingHandler) Completed(w http.ResponseWriter, r *http.Request) {
 
 // declineRequest is the body for POST /route/decline.
 type declineRequest struct {
-	Email  string `json:"email"`
+	UserID string `json:"userId"`
 	CaseID string `json:"caseId"`
 }
 
@@ -191,12 +190,12 @@ func (h *RoutingHandler) Decline(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if req.Email == "" || req.CaseID == "" {
-		writeError(w, http.StatusBadRequest, "email and caseId are required.")
+	if req.UserID == "" || req.CaseID == "" {
+		writeError(w, http.StatusBadRequest, "userId and caseId are required.")
 		return
 	}
 
-	result, err := h.router.Decline(r.Context(), req.Email, req.CaseID)
+	result, err := h.router.Decline(r.Context(), req.UserID, req.CaseID)
 	if err != nil {
 		writeStorageError(w, "decline", err)
 		return
@@ -206,11 +205,11 @@ func (h *RoutingHandler) Decline(w http.ResponseWriter, r *http.Request) {
 
 // acceptRequest is the body for POST /route/accept.
 type acceptRequest struct {
-	Email  string `json:"email"`
+	UserID string `json:"userId"`
 	CaseID string `json:"caseId"`
 }
 
-// Accept handles POST /route/accept -- confirms email is accepting the
+// Accept handles POST /route/accept -- confirms userId is accepting the
 // case they were assigned (PENDING -> BUSY). See router.Router.Accept's
 // own doc comment for when Applied comes back false instead of erroring.
 func (h *RoutingHandler) Accept(w http.ResponseWriter, r *http.Request) {
@@ -218,12 +217,12 @@ func (h *RoutingHandler) Accept(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if req.Email == "" || req.CaseID == "" {
-		writeError(w, http.StatusBadRequest, "email and caseId are required.")
+	if req.UserID == "" || req.CaseID == "" {
+		writeError(w, http.StatusBadRequest, "userId and caseId are required.")
 		return
 	}
 
-	result, err := h.router.Accept(r.Context(), req.Email, req.CaseID)
+	result, err := h.router.Accept(r.Context(), req.UserID, req.CaseID)
 	if err != nil {
 		writeStorageError(w, "accept", err)
 		return
@@ -231,18 +230,18 @@ func (h *RoutingHandler) Accept(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// GetPresence handles GET /route/presence/{email}. Includes currentCase
+// GetPresence handles GET /route/presence/{userId}. Includes currentCase
 // (omitted when there is none) so a caller whose own UI state for a
 // pending alert or active session was lost -- a browser refresh, a closed
 // tab -- can rehydrate it instead of the engineer being stuck PENDING or
 // BUSY with nothing to act on (see router.Router.PresenceDetail).
 func (h *RoutingHandler) GetPresence(w http.ResponseWriter, r *http.Request) {
-	email := r.PathValue("email")
-	if email == "" {
-		writeError(w, http.StatusBadRequest, "email is required.")
+	userID := r.PathValue("userId")
+	if userID == "" {
+		writeError(w, http.StatusBadRequest, "userId is required.")
 		return
 	}
-	detail, err := h.router.GetPresence(r.Context(), email)
+	detail, err := h.router.GetPresence(r.Context(), userID)
 	if err != nil {
 		writeStorageError(w, "presence:get", err)
 		return
@@ -265,10 +264,12 @@ func (h *RoutingHandler) GetPresence(w http.ResponseWriter, r *http.Request) {
 }
 
 // workItemRequest is the body for POST /route/workitem -- see
-// router.Router.CreateWorkItem.
+// router.Router.CreateWorkItem. ConversationID used to be part of this
+// request (persisted into chat_conversation.conversation_id) -- dropped
+// along with that column, see migrations/000010_chat_conversation_state.up.sql's
+// own doc comment.
 type workItemRequest struct {
 	CaseID         string `json:"caseId"`
-	ConversationID string `json:"conversationId"`
 	CreatorEmail   string `json:"creatorEmail"`
 	Subject        string `json:"subject"`
 	InitialMessage string `json:"initialMessage"`
@@ -282,12 +283,12 @@ func (h *RoutingHandler) CreateWorkItem(w http.ResponseWriter, r *http.Request) 
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if req.CaseID == "" || req.ConversationID == "" || req.CreatorEmail == "" || req.Subject == "" {
-		writeError(w, http.StatusBadRequest, "caseId, conversationId, creatorEmail, and subject are required.")
+	if req.CaseID == "" || req.CreatorEmail == "" || req.Subject == "" {
+		writeError(w, http.StatusBadRequest, "caseId, creatorEmail, and subject are required.")
 		return
 	}
 
-	if err := h.router.CreateWorkItem(r.Context(), req.CaseID, req.ConversationID, req.CreatorEmail, req.Subject, req.InitialMessage); err != nil {
+	if err := h.router.CreateWorkItem(r.Context(), req.CaseID, req.CreatorEmail, req.Subject, req.InitialMessage); err != nil {
 		writeStorageError(w, "workitem:create", err)
 		return
 	}
