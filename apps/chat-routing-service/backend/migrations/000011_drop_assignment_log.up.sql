@@ -1,0 +1,44 @@
+-- Copyright (c) 2026 WSO2 LLC. (https://www.wso2.com).
+--
+-- WSO2 LLC. licenses this file to you under the Apache License,
+-- Version 2.0 (the "License"); you may not use this file except
+-- in compliance with the License.
+-- You may obtain a copy of the License at
+--
+-- http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+
+-- Per the 2026-09-07 DB schema review (see the project's
+-- db-schema-review-2026-09-07-outcomes.md doc): a dedicated
+-- engineer-assignment-history table was proposed and dropped as redundant
+-- -- "recent assignees could be derived directly from existing
+-- relationships within the chat conversation table without maintaining
+-- redundant records."
+--
+-- assignment_log's one real consumer was the "fewest chats today" ranking
+-- (see internal/router/state.go's popAvailableEngineer/debugEngineers/
+-- debugAvailable) -- this drops it in favor of COUNT(*) over
+-- chat_conversation (engineer_id, updated_at), joined the same way. Note
+-- the resulting metric changes meaning slightly: assignment_log counted
+-- every case an engineer was ASSIGNED today (even one they later declined
+-- or timed out on); chat_conversation.engineer_id is only set once
+-- Router.Accept actually confirms them (see setConversationEngineer), so
+-- the derived count is "chats ACCEPTED today" instead. This is arguably
+-- the fairer metric for load-balancing (an engineer whose assignment was
+-- immediately stolen by a decline/timeout no longer counts against them),
+-- but it is a real behavior change, not a pure refactor -- flagged here
+-- for whoever next touches this ranking.
+--
+-- chat_conversation is itself a LOCAL STAND-IN table (see
+-- internal/router/workitem.go's package doc comment) meant to be deleted
+-- once entity-service's real work_item/chat_conversation schema ships --
+-- this ranking query now depends on it, so that future migration needs to
+-- carry this query along (or reinstate an equivalent) rather than just
+-- dropping the table out from under it.
+DROP TABLE IF EXISTS chat_routing.assignment_log;

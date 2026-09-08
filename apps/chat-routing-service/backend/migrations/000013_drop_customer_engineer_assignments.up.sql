@@ -1,0 +1,36 @@
+-- Copyright (c) 2026 WSO2 LLC. (https://www.wso2.com).
+--
+-- WSO2 LLC. licenses this file to you under the Apache License,
+-- Version 2.0 (the "License"); you may not use this file except
+-- in compliance with the License.
+-- You may obtain a copy of the License at
+--
+-- http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+
+-- 2026-09-07 DB schema review (see the project's
+-- db-schema-review-2026-09-07-outcomes.md doc, and the meeting's own full
+-- transcript): customer_engineer_assignments ("sticky routing") is dropped
+-- entirely. Sajith Ekanayaka confirmed it is fully derivable rather than a
+-- table this feature needs to maintain -- "here you are just trying to
+-- pull the recent engineer for a customer, right? This auto der[ive],
+-- right?" / "Yeah." -- and it is also simply absent from every schema this
+-- project's own stakeholders have since described (both the pasted target
+-- field list and the review's own conclusions never mention it again).
+-- Router.Escalate's sticky-engineer preference (stickyOrLeastBusyEngineer /
+-- stickyEngineerFor / lockEngineerIfAvailable) is removed in the same
+-- change -- every escalation now goes straight to the least-busy-available
+-- ranking (see internal/router/state.go and popAvailableEngineer's own doc
+-- comment). This was previously left in place after the 2026-09-08
+-- implementation pass by mistake -- an earlier read of the review's own
+-- short bullet-point summary, rather than the full transcript, understated
+-- this table's removal; see this migration's own presence for the
+-- correction and db-schema-review-2026-09-07-outcomes.md's updated
+-- "Implementation status" section for the full account.
+DROP TABLE IF EXISTS chat_routing.customer_engineer_assignments;
