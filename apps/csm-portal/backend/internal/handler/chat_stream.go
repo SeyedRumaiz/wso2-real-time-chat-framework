@@ -43,8 +43,10 @@ const engineerAlertStreamHeartbeat = 15 * time.Second
 // Kafka-backed fallback path to degrade to.
 //
 // Registers under TWO stream.BroadcastHub keys at once: this engineer's own
-// (engineerHubKey(user.Email)), where the routing service's targeted
-// deliveries land, and the shared broadcastHubKey, which now serves only as
+// (engineerHubKey(user.UserID) -- the IdP "userid" claim, see
+// chat-routing-service's migrations/000014_rename_engineer_status_table for
+// why this is a user ID rather than an email), where the routing service's
+// targeted deliveries land, and the shared broadcastHubKey, which now serves only as
 // the escalate fallback when the routing service is unreachable and as the
 // (still-broadcast) customer-message relay — see chat.go's package doc
 // comment and broadcastHubKey's own doc comment for why those two cases
@@ -76,7 +78,7 @@ func (h *ChatHandler) StreamEngineerAlerts(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	ownKey := engineerHubKey(user.Email)
+	ownKey := engineerHubKey(user.UserID)
 	ownCh := h.hub.Register(ownKey)
 	defer h.hub.Unregister(ownKey, ownCh)
 

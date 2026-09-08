@@ -94,8 +94,13 @@ const broadcastHubKey = "engineers"
 // engineerHubKey returns the stream.BroadcastHub subscription key a
 // specific engineer's alert stream registers under for targeted delivery —
 // e.g. an escalation the routing service assigned to exactly this engineer.
-func engineerHubKey(email string) string {
-	return "engineer:" + email
+// userID is the IdP "userid" claim (middleware.UserInfo.UserID) -- this key
+// used to be built from the engineer's email; switched to userID alongside
+// chat-routing-service's own engineer-identity switch (see that service's
+// migrations/000014_rename_engineer_status_table) so both sides agree on
+// which key a given engineer's events land on.
+func engineerHubKey(userID string) string {
+	return "engineer:" + userID
 }
 
 // maxChatBodyBytes caps request bodies on the chat endpoints below —
@@ -130,11 +135,15 @@ type chatEventPusher interface {
 // methods exactly, so *routingclient.Client satisfies this with no adapter.
 type routingService interface {
 	Escalate(ctx context.Context, ci routingclient.CaseInfo) (routingclient.EscalateResult, error)
-	SetPresence(ctx context.Context, email, engineerID string, status routingclient.Status) (routingclient.PresenceResult, error)
-	Completed(ctx context.Context, email string) (routingclient.CompletedResult, error)
-	Decline(ctx context.Context, email, caseID string) (routingclient.DeclineResult, error)
-	Accept(ctx context.Context, email, caseID string) (routingclient.AcceptResult, error)
-	GetPresence(ctx context.Context, email string) (routingclient.PresenceDetail, error)
+	// SetPresence/Completed/Decline/Accept/GetPresence identify the engineer
+	// by their IdP "userid" claim (middleware.UserInfo.UserID) -- see
+	// chat-routing-service's migrations/000014_rename_engineer_status_table
+	// for why this switched from an email.
+	SetPresence(ctx context.Context, userID string, status routingclient.Status) (routingclient.PresenceResult, error)
+	Completed(ctx context.Context, userID string) (routingclient.CompletedResult, error)
+	Decline(ctx context.Context, userID, caseID string) (routingclient.DeclineResult, error)
+	Accept(ctx context.Context, userID, caseID string) (routingclient.AcceptResult, error)
+	GetPresence(ctx context.Context, userID string) (routingclient.PresenceDetail, error)
 	// SweepTimeouts is polled periodically by ChatHandler.StartTimeoutSweeper
 	// (see that method's doc comment) -- not called from any HTTP handler in
 	// this file directly.
@@ -144,7 +153,7 @@ type routingService interface {
 	// project's chat-persistence-mapping-plan.md) -- they exist only until
 	// entity-service's real generic work_item/chat_conversation/comment
 	// schema ships, at which point these calls move there instead.
-	CreateWorkItem(ctx context.Context, caseID, conversationID, creatorEmail, subject, initialMessage string) error
+	CreateWorkItem(ctx context.Context, caseID, creatorEmail, subject, initialMessage string) error
 	AddComment(ctx context.Context, caseID, authorEmail, content string) error
 }
 
@@ -208,9 +217,13 @@ func (h *ChatHandler) publishToEngineers(evt chatEvent) {
 // publishToEngineer delivers evt only to the named engineer's own SSE
 // subscription (see engineerHubKey) — used for every routing-service-backed
 // delivery: a fresh routed escalation, a queue-drain assignment on
-// presence/session-completion, or a reassignment after a decline.
-func (h *ChatHandler) publishToEngineer(email string, evt chatEvent) {
-	h.publish(engineerHubKey(email), evt)
+// presence/session-completion, or a reassignment after a decline. userID is
+// the IdP "userid" claim (middleware.UserInfo.UserID) -- the routing
+// service's own EscalateResult.EngineerUserID/DeclineResult.ReassignedTo
+// already return this value directly (see chat-routing-service's
+// migrations/000014_rename_engineer_status_table).
+func (h *ChatHandler) publishToEngineer(userID string, evt chatEvent) {
+	h.publish(engineerHubKey(userID), evt)
 }
 
 // notifyBackendV2 pushes evt to customer-portal/backend-v2's
@@ -342,13 +355,13 @@ func (h *ChatHandler) HandleEscalate(w http.ResponseWriter, r *http.Request) {
 	// record for this escalation. Must not block the live routing decision
 	// above, which has already succeeded and must reach the customer
 	// regardless of whether this bookkeeping call does.
-	if err := h.routing.CreateWorkItem(r.Context(), req.CaseID, req.ConversationID, req.CustomerEmail, ci.Subject, req.Message); err != nil {
+	if err := h.routing.CreateWorkItem(r.Context(), req.CaseID, req.CustomerEmail, ci.Subject, req.Message); err != nil {
 		slog.WarnContext(r.Context(), "chat: routing service create work item failed (non-blocking)", "caseId", req.CaseID, "err", err)
 	}
 
 	switch {
-	case result.EngineerEmail != "":
-		h.publishToEngineer(result.EngineerEmail, assignedCaseEvent(ci))
+	case result.EngineerUserID != "":
+		h.publishToEngineer(result.EngineerUserID, assignedCaseEvent(ci))
 	case result.Queued:
 		h.notifyBackendV2(r.Context(), chatEvent{
 			Type:           "queued",
@@ -468,7 +481,7 @@ func (h *ChatHandler) HandleAcceptSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	acceptResult, err := h.routing.Accept(r.Context(), user.Email, caseID)
+	acceptResult, err := h.routing.Accept(r.Context(), user.UserID, caseID)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "chat: routing service accept failed", "userID", user.UserID, "caseID", caseID, "err", err)
 		writeError(w, http.StatusBadGateway, "Failed to accept the chat session. Please try again.")
@@ -631,10 +644,10 @@ func (h *ChatHandler) HandleCompleteSession(w http.ResponseWriter, r *http.Reque
 	// logged, not surfaced to the caller — the session has already ended
 	// successfully from the engineer's point of view, matching this
 	// handler's existing best-effort treatment of notifyBackendV2 above.
-	if result, err := h.routing.Completed(r.Context(), user.Email); err != nil {
+	if result, err := h.routing.Completed(r.Context(), user.UserID); err != nil {
 		slog.ErrorContext(r.Context(), "chat: routing service completed failed", "userID", user.UserID, "err", err)
 	} else if result.AssignedCase != nil {
-		h.publishToEngineer(user.Email, assignedCaseEvent(*result.AssignedCase))
+		h.publishToEngineer(user.UserID, assignedCaseEvent(*result.AssignedCase))
 	}
 
 	writeJSON(w, http.StatusOK, []byte(`{"message":"session ended"}`))
@@ -686,7 +699,7 @@ func (h *ChatHandler) HandleSetPresence(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	result, err := h.routing.SetPresence(r.Context(), user.Email, user.UserID, status)
+	result, err := h.routing.SetPresence(r.Context(), user.UserID, status)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "chat: routing service set presence failed", "userID", user.UserID, "err", err)
 		writeError(w, http.StatusBadGateway, "Failed to update your status. Please try again.")
@@ -694,7 +707,7 @@ func (h *ChatHandler) HandleSetPresence(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if result.AssignedCase != nil {
-		h.publishToEngineer(user.Email, assignedCaseEvent(*result.AssignedCase))
+		h.publishToEngineer(user.UserID, assignedCaseEvent(*result.AssignedCase))
 	}
 
 	writeJSONValue(w, http.StatusOK, result)
@@ -716,7 +729,7 @@ func (h *ChatHandler) HandleGetPresence(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	detail, err := h.routing.GetPresence(r.Context(), user.Email)
+	detail, err := h.routing.GetPresence(r.Context(), user.UserID)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "chat: routing service get presence failed", "userID", user.UserID, "err", err)
 		writeError(w, http.StatusBadGateway, "Failed to load your status. Please try again.")
@@ -765,7 +778,7 @@ func (h *ChatHandler) HandleDeclineSession(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	result, err := h.routing.Decline(r.Context(), user.Email, caseID)
+	result, err := h.routing.Decline(r.Context(), user.UserID, caseID)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "chat: routing service decline failed", "userID", user.UserID, "caseID", caseID, "err", err)
 		writeError(w, http.StatusBadGateway, "Failed to decline the chat session. Please try again.")

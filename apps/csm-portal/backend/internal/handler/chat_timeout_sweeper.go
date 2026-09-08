@@ -63,7 +63,7 @@ func (h *ChatHandler) sweepTimeoutsOnce(ctx context.Context) {
 	}
 	for _, result := range results {
 		slog.InfoContext(ctx, "chat: engineer timed out on pending case",
-			"engineerEmail", result.Email, "caseId", result.CaseID,
+			"userID", result.UserID, "caseId", result.CaseID,
 			"reassignedTo", result.ReassignedTo, "requeued", result.Requeued)
 
 		// Tell the unresponsive engineer's own browser their stale pending
@@ -75,7 +75,7 @@ func (h *ChatHandler) sweepTimeoutsOnce(ctx context.Context) {
 		// browser (an unrecognised type is simply ignored) -- it does not
 		// block the reassignment below, which is the part that actually
 		// matters for the customer.
-		h.publishToEngineer(result.Email, chatEvent{
+		h.publishToEngineer(result.UserID, chatEvent{
 			Type:      "case_timed_out",
 			CaseID:    result.CaseID,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
