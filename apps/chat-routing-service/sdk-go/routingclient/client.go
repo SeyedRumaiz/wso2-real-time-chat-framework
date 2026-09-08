@@ -15,10 +15,10 @@
 // under the License.
 
 // Package routingclient is the client SDK for chat-routing-service
-// (apps/chat-routing-service/backend) — the in-memory engineer
-// availability/queue state machine that decides which engineer (if any) an
-// escalation is routed to. See that service's internal/handler/routes.go
-// for the exact routes and response shapes this client mirrors.
+// (apps/chat-routing-service/backend) — the engineer availability/queue
+// state machine that decides which engineer (if any) an escalation is
+// routed to. See that service's internal/handler/routes.go for the exact
+// routes and response shapes this client mirrors.
 //
 // # Server-to-server only
 //
@@ -133,9 +133,13 @@ type CaseInfo struct {
 
 // EscalateResult mirrors router.EscalateResult.
 type EscalateResult struct {
-	EngineerEmail string `json:"engineerEmail,omitempty"`
-	Queued        bool   `json:"queued,omitempty"`
-	Position      int    `json:"position,omitempty"`
+	// EngineerUserID is the IdP "userid" claim of the engineer this case was
+	// assigned to (see chat-routing-service's migrations/
+	// 000014_rename_engineer_status_table for why this is a user ID rather
+	// than an email) -- empty when Queued.
+	EngineerUserID string `json:"engineerId,omitempty"`
+	Queued         bool   `json:"queued,omitempty"`
+	Position       int    `json:"position,omitempty"`
 }
 
 // PresenceResult mirrors router.PresenceResult.
@@ -154,6 +158,8 @@ type CompletedResult struct {
 
 // DeclineResult mirrors router.DeclineResult.
 type DeclineResult struct {
+	// ReassignedTo is the user ID of the engineer the case was handed to
+	// instead.
 	ReassignedTo string `json:"reassignedTo,omitempty"`
 	Requeued     bool   `json:"requeued,omitempty"`
 	// AssignedCase is set alongside ReassignedTo — the declined case, now
@@ -173,7 +179,7 @@ type AcceptResult struct {
 // PENDING_TIMEOUT_SECONDS, so that service reassigned or requeued it on
 // their behalf and took them OFFLINE.
 type TimeoutResult struct {
-	Email        string    `json:"email"`
+	UserID       string    `json:"userId"`
 	CaseID       string    `json:"caseId"`
 	ReassignedTo string    `json:"reassignedTo,omitempty"`
 	Requeued     bool      `json:"requeued,omitempty"`
@@ -234,55 +240,54 @@ func (c *Client) Escalate(ctx context.Context, ci CaseInfo) (EscalateResult, err
 
 // SetPresence calls POST /route/presence, applying an engineer's requested
 // status change (see router.Router.SetPresence's doc comment for the full
-// state machine this triggers). engineerID is the caller's stable
-// per-account identifier (e.g. an IdP "userid" claim) -- the routing
-// service only uses it the first time it sees email, to populate that new
-// row's engineer_id primary key; it's ignored (not an error) on every
-// later call for an already-known email.
-func (c *Client) SetPresence(ctx context.Context, email, engineerID string, status Status) (PresenceResult, error) {
+// state machine this triggers). userID is the caller's stable per-account
+// identifier (e.g. an IdP "userid" claim) -- the routing service's
+// cs_engineer_status table is keyed by it directly, so this is the only
+// identifier this call needs, on both a first-contact and a later call for
+// the same engineer.
+func (c *Client) SetPresence(ctx context.Context, userID string, status Status) (PresenceResult, error) {
 	var out PresenceResult
 	body := struct {
-		Email      string `json:"email"`
-		EngineerID string `json:"engineerId"`
-		Status     Status `json:"status"`
-	}{Email: email, EngineerID: engineerID, Status: status}
+		UserID string `json:"userId"`
+		Status Status `json:"status"`
+	}{UserID: userID, Status: status}
 	err := c.do(ctx, http.MethodPost, "/route/presence", body, &out)
 	return out, err
 }
 
-// Completed calls POST /route/completed, reporting that email just ended
+// Completed calls POST /route/completed, reporting that userID just ended
 // their current session.
-func (c *Client) Completed(ctx context.Context, email string) (CompletedResult, error) {
+func (c *Client) Completed(ctx context.Context, userID string) (CompletedResult, error) {
 	var out CompletedResult
 	body := struct {
-		Email string `json:"email"`
-	}{Email: email}
+		UserID string `json:"userId"`
+	}{UserID: userID}
 	err := c.do(ctx, http.MethodPost, "/route/completed", body, &out)
 	return out, err
 }
 
-// Decline calls POST /route/decline, reporting that email is declining the
+// Decline calls POST /route/decline, reporting that userID is declining the
 // case identified by caseID before accepting it.
-func (c *Client) Decline(ctx context.Context, email, caseID string) (DeclineResult, error) {
+func (c *Client) Decline(ctx context.Context, userID, caseID string) (DeclineResult, error) {
 	var out DeclineResult
 	body := struct {
-		Email  string `json:"email"`
+		UserID string `json:"userId"`
 		CaseID string `json:"caseId"`
-	}{Email: email, CaseID: caseID}
+	}{UserID: userID, CaseID: caseID}
 	err := c.do(ctx, http.MethodPost, "/route/decline", body, &out)
 	return out, err
 }
 
-// Accept calls POST /route/accept, confirming email is accepting the case
+// Accept calls POST /route/accept, confirming userID is accepting the case
 // (caseID) they were assigned -- flips PENDING to BUSY server-side. See
 // router.Router.Accept's own doc comment for when Applied comes back
 // false (a stale accept) rather than an error.
-func (c *Client) Accept(ctx context.Context, email, caseID string) (AcceptResult, error) {
+func (c *Client) Accept(ctx context.Context, userID, caseID string) (AcceptResult, error) {
 	var out AcceptResult
 	body := struct {
-		Email  string `json:"email"`
+		UserID string `json:"userId"`
 		CaseID string `json:"caseId"`
-	}{Email: email, CaseID: caseID}
+	}{UserID: userID, CaseID: caseID}
 	err := c.do(ctx, http.MethodPost, "/route/accept", body, &out)
 	return out, err
 }
@@ -291,15 +296,17 @@ func (c *Client) Accept(ctx context.Context, email, caseID string) (AcceptResult
 // see chat-routing-service's internal/router/workitem.go package doc
 // comment. Creates the work_item + chat_conversation pair (plus the first
 // comment, if initialMessage is non-empty) for a brand-new escalation.
-func (c *Client) CreateWorkItem(ctx context.Context, caseID, conversationID, creatorEmail, subject, initialMessage string) error {
+// creatorEmail attributes the work item to the CUSTOMER who escalated, not
+// an engineer -- unaffected by chat-routing-service's engineer-identity
+// switch to user IDs (see migrations/000014_rename_engineer_status_table).
+func (c *Client) CreateWorkItem(ctx context.Context, caseID, creatorEmail, subject, initialMessage string) error {
 	body := struct {
 		CaseID         string `json:"caseId"`
-		ConversationID string `json:"conversationId"`
 		CreatorEmail   string `json:"creatorEmail"`
 		Subject        string `json:"subject"`
 		InitialMessage string `json:"initialMessage,omitempty"`
 	}{
-		CaseID: caseID, ConversationID: conversationID, CreatorEmail: creatorEmail,
+		CaseID: caseID, CreatorEmail: creatorEmail,
 		Subject: subject, InitialMessage: initialMessage,
 	}
 	return c.do(ctx, http.MethodPost, "/route/workitem", body, nil)
@@ -308,7 +315,9 @@ func (c *Client) CreateWorkItem(ctx context.Context, caseID, conversationID, cre
 // AddComment calls POST /route/comment -- LOCAL STAND-IN persistence, same
 // caveat as CreateWorkItem above. Used for both directions of a live chat
 // message (customer and engineer) so the whole transcript lands in one
-// place.
+// place. authorEmail is a free-text attribution column (comment.
+// created_by), not an identity join -- also unaffected by the engineer
+// user-ID switch.
 func (c *Client) AddComment(ctx context.Context, caseID, authorEmail, content string) error {
 	body := struct {
 		CaseID      string `json:"caseId"`
@@ -336,12 +345,12 @@ type PresenceDetail struct {
 	PendingTimeoutSeconds int `json:"pendingTimeoutSeconds"`
 }
 
-// GetPresence calls GET /route/presence/{email}, returning StatusOffline
+// GetPresence calls GET /route/presence/{userId}, returning StatusOffline
 // (and no case) for an engineer the routing service has never seen a
 // presence update from (see router.Router.GetPresence).
-func (c *Client) GetPresence(ctx context.Context, email string) (PresenceDetail, error) {
+func (c *Client) GetPresence(ctx context.Context, userID string) (PresenceDetail, error) {
 	var out PresenceDetail
-	err := c.do(ctx, http.MethodGet, "/route/presence/"+url.PathEscape(email), nil, &out)
+	err := c.do(ctx, http.MethodGet, "/route/presence/"+url.PathEscape(userID), nil, &out)
 	if err != nil {
 		return PresenceDetail{}, err
 	}

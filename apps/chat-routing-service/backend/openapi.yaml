@@ -7,10 +7,17 @@ info:
     url: https://www.apache.org/licenses/LICENSE-2.0
   description: >-
     Decides which engineer (if any) picks up a live-engineer-chat escalation,
-    and persists engineer presence, the FIFO waiting queue, and per-customer
-    sticky routing. See this service's README.md for the full state machine,
-    assignment-priority rules, and data model — this spec documents only the
-    wire contract.
+    and persists engineer presence and the FIFO waiting queue. See this
+    service's README.md for the full state machine, assignment-priority
+    rules, and data model — this spec documents only the wire contract.
+
+
+    Engineers are identified throughout this API by their IdP `userid` claim
+    (`userId` on every request/response below), not their email — see the
+    README's 2026-09-07 DB schema review note. A per-customer "sticky"
+    routing preference used to run ahead of the least-busy ranking; it was
+    dropped in that same review as fully derivable, unnecessary state (see
+    `migrations/000013_drop_customer_engineer_assignments.up.sql`).
 
 
     Every route under `/route/*` is server-to-server only, authenticated with
@@ -65,7 +72,7 @@ paths:
       summary: >-
         Route a new escalation to an engineer, or enqueue it if nobody is
         available. See README.md "Assignment priority" for the full
-        sticky-then-least-busy-then-queue ordering.
+        least-busy-then-queue ordering.
       operationId: escalate
       requestBody:
         required: true
@@ -76,7 +83,7 @@ paths:
       responses:
         "200":
           description: >-
-            Either an engineer was assigned (engineerEmail set) or the case
+            Either an engineer was assigned (engineerId set) or the case
             was queued (queued + position set) — never both.
           content:
             application/json:
@@ -237,7 +244,7 @@ paths:
         "502":
           $ref: '#/components/responses/StorageUnavailable'
 
-  /route/presence/{email}:
+  /route/presence/{userId}:
     get:
       tags: [routing]
       summary: >-
@@ -246,12 +253,12 @@ paths:
         (e.g. after a browser refresh) from server-side truth.
       operationId: getPresence
       parameters:
-        - name: email
+        - name: userId
           in: path
           required: true
+          description: The IdP's stable per-account userid claim.
           schema:
             type: string
-            format: email
       responses:
         "200":
           description: Defaults to status OFFLINE with no currentCase for an unseen engineer.
@@ -359,11 +366,11 @@ paths:
   /route/debug/state:
     get:
       tags: [debug]
-      summary: Full dump of engineers (with today's chat count) and the escalation queue. Verification only.
+      summary: Full dump of engineers (with today's chat count) and the chat queue. Verification only.
       operationId: debugState
       responses:
         "200":
-          description: engineers (with today's live chat count) and the current escalation_queue contents.
+          description: cs_engineer_status rows (with today's live chat count) and the current chat_queue contents.
           content:
             application/json:
               schema:
@@ -451,9 +458,11 @@ components:
     EscalateResponse:
       type: object
       properties:
-        engineerEmail:
+        engineerId:
           type: string
-          description: Set when a specific engineer was assigned.
+          description: >-
+            The IdP userid claim of the engineer who was assigned. Set only
+            when a specific engineer was assigned.
         queued:
           type: boolean
           description: Set when nobody was available and the case was enqueued instead.
@@ -463,17 +472,14 @@ components:
 
     PresenceRequest:
       type: object
-      required: [email, engineerId, status]
+      required: [userId, status]
       properties:
-        email:
-          type: string
-          format: email
-        engineerId:
+        userId:
           type: string
           description: >-
-            The IdP's stable per-account userid claim. Required so a
-            first-time presence update can create the engineer's row;
-            ignored (not an error) once that row already exists.
+            The IdP's stable per-account userid claim — this table's
+            primary key, so nothing else is needed to create the engineer's
+            row on first contact.
         status:
           type: string
           enum: [AVAILABLE, OFFLINE]
@@ -492,11 +498,11 @@ components:
 
     CompletedRequest:
       type: object
-      required: [email]
+      required: [userId]
       properties:
-        email:
+        userId:
           type: string
-          format: email
+          description: The IdP's stable per-account userid claim.
 
     CompletedResponse:
       type: object
@@ -512,11 +518,11 @@ components:
 
     DeclineRequest:
       type: object
-      required: [email, caseId]
+      required: [userId, caseId]
       properties:
-        email:
+        userId:
           type: string
-          format: email
+          description: The IdP's stable per-account userid claim.
         caseId:
           type: string
 
@@ -525,7 +531,7 @@ components:
       properties:
         reassignedTo:
           type: string
-          description: Set when another available engineer was found.
+          description: Set to the newly assigned engineer's userId when another available engineer was found.
         requeued:
           type: boolean
           description: Set when nobody was available and the case went back to the front of the queue.
@@ -534,11 +540,11 @@ components:
 
     AcceptRequest:
       type: object
-      required: [email, caseId]
+      required: [userId, caseId]
       properties:
-        email:
+        userId:
           type: string
-          format: email
+          description: The IdP's stable per-account userid claim.
         caseId:
           type: string
 
@@ -554,16 +560,16 @@ components:
       description: >-
         One engineer's outcome from a timeout sweep -- exactly one of
         reassignedTo (with assignedCase) or requeued applies. The engineer
-        named in email is always taken OFFLINE as part of this.
+        named in userId is always taken OFFLINE as part of this.
       properties:
-        email:
+        userId:
           type: string
-          format: email
+          description: The IdP's stable per-account userid claim.
         caseId:
           type: string
         reassignedTo:
           type: string
-          description: Set when another available engineer was found.
+          description: Set to the newly assigned engineer's userId when another available engineer was found.
         requeued:
           type: boolean
           description: Set when nobody was available and the case went back to the front of the queue.
@@ -595,11 +601,9 @@ components:
 
     WorkItemRequest:
       type: object
-      required: [caseId, conversationId, creatorEmail, subject]
+      required: [caseId, creatorEmail, subject]
       properties:
         caseId:
-          type: string
-        conversationId:
           type: string
         creatorEmail:
           type: string
