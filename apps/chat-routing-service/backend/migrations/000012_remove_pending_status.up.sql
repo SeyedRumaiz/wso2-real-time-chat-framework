@@ -66,6 +66,16 @@ CREATE TYPE chat_routing.engineer_status_new AS ENUM ('AVAILABLE', 'BUSY', 'OFFL
 
 ALTER TABLE chat_routing.engineers ALTER COLUMN status DROP DEFAULT;
 
+-- chk_available_since_only_when_available and idx_engineers_available_since
+-- both embed a 'AVAILABLE' literal compiled against the OLD engineer_status
+-- type. Postgres re-validates both against the column's NEW type as part of
+-- the ALTER COLUMN ... TYPE below, and that re-validation compares the two
+-- enum types directly (engineer_status_new = engineer_status) rather than
+-- re-compiling the literal, which fails with "operator does not exist".
+-- Dropped here, recreated below once the type swap is complete.
+ALTER TABLE chat_routing.engineers DROP CONSTRAINT chk_available_since_only_when_available;
+DROP INDEX chat_routing.idx_engineers_available_since;
+
 ALTER TABLE chat_routing.engineers
   ALTER COLUMN status TYPE chat_routing.engineer_status_new
   USING (CASE WHEN status::text = 'PENDING' THEN 'BUSY' ELSE status::text END)::chat_routing.engineer_status_new;
@@ -74,6 +84,14 @@ ALTER TABLE chat_routing.engineers ALTER COLUMN status SET DEFAULT 'OFFLINE';
 
 DROP TYPE chat_routing.engineer_status;
 ALTER TYPE chat_routing.engineer_status_new RENAME TO engineer_status;
+
+ALTER TABLE chat_routing.engineers
+  ADD CONSTRAINT chk_available_since_only_when_available
+  CHECK (available_since IS NULL OR (status = 'AVAILABLE' AND current_case_id IS NULL));
+
+CREATE INDEX idx_engineers_available_since
+  ON chat_routing.engineers (available_since)
+  WHERE status = 'AVAILABLE' AND current_case_id IS NULL;
 
 ALTER TABLE chat_routing.engineers
   ADD CONSTRAINT chk_accepted_only_with_case
