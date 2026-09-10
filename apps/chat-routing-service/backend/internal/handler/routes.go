@@ -40,10 +40,9 @@ type RoutingHandler struct {
 }
 
 // NewRoutingHandler constructs a RoutingHandler over r. pendingTimeout is
-// how long an engineer can sit PENDING (assigned, not yet accepted) before
-// SweepTimeouts reassigns/requeues their case -- see
-// router.Router.SweepExpiredPending and cmd/server/main.go's
-// PENDING_TIMEOUT_SECONDS.
+// how long a conversation can sit assigned-but-unconfirmed before
+// SweepTimeouts reassigns/requeues it -- see router.Router.
+// SweepExpiredPending and cmd/server/main.go's PENDING_TIMEOUT_SECONDS.
 func NewRoutingHandler(r *router.Router, pendingTimeout time.Duration) *RoutingHandler {
 	return &RoutingHandler{router: r, pendingTimeout: pendingTimeout}
 }
@@ -76,18 +75,22 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
+// isValidStatus reports whether s is a chat_status an engineer can
+// directly request -- AVAILABLE, BUSY (do-not-disturb), or OFFLINE. There
+// is no PENDING here: pending is a per-case fact (see router.CaseStatus),
+// never something requested for an engineer as a whole.
 func isValidStatus(s string) bool {
 	switch router.Status(s) {
-	case router.StatusAvailable, router.StatusPending, router.StatusBusy, router.StatusOffline:
+	case router.StatusAvailable, router.StatusBusy, router.StatusOffline:
 		return true
 	default:
 		return false
 	}
 }
 
-// escalateRequest is the body csm-portal/backend sends for
-// POST /route/escalate — one field per router.CaseInfo field.
-type escalateRequest struct {
+// caseInfoRequest is the body shape shared by POST /route/escalate and
+// POST /route/workitem -- one field per router.CaseInfo field.
+type caseInfoRequest struct {
 	CaseID         string `json:"caseId"`
 	ConversationID string `json:"conversationId"`
 	ProjectID      string `json:"projectId"`
@@ -97,9 +100,21 @@ type escalateRequest struct {
 	Message        string `json:"message"`
 }
 
+func (req caseInfoRequest) toCaseInfo() router.CaseInfo {
+	return router.CaseInfo{
+		CaseID:         req.CaseID,
+		ConversationID: req.ConversationID,
+		ProjectID:      req.ProjectID,
+		Subject:        req.Subject,
+		CustomerEmail:  req.CustomerEmail,
+		CustomerName:   req.CustomerName,
+		Message:        req.Message,
+	}
+}
+
 // Escalate handles POST /route/escalate.
 func (h *RoutingHandler) Escalate(w http.ResponseWriter, r *http.Request) {
-	var req escalateRequest
+	var req caseInfoRequest
 	if !decodeBody(w, r, &req) {
 		return
 	}
@@ -108,15 +123,7 @@ func (h *RoutingHandler) Escalate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.router.Escalate(r.Context(), router.CaseInfo{
-		CaseID:         req.CaseID,
-		ConversationID: req.ConversationID,
-		ProjectID:      req.ProjectID,
-		Subject:        req.Subject,
-		CustomerEmail:  req.CustomerEmail,
-		CustomerName:   req.CustomerName,
-		Message:        req.Message,
-	})
+	result, err := h.router.Escalate(r.Context(), req.toCaseInfo())
 	if err != nil {
 		writeStorageError(w, "escalate", err)
 		return
@@ -139,7 +146,7 @@ func (h *RoutingHandler) SetPresence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.UserID == "" || !isValidStatus(req.Status) {
-		writeError(w, http.StatusBadRequest, "userId and a valid status (AVAILABLE|OFFLINE) are required.")
+		writeError(w, http.StatusBadRequest, "userId and a valid status (AVAILABLE|BUSY|OFFLINE) are required.")
 		return
 	}
 
@@ -151,9 +158,12 @@ func (h *RoutingHandler) SetPresence(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// completedRequest is the body for POST /route/completed.
+// completedRequest is the body for POST /route/completed. CaseID
+// identifies which of the engineer's (possibly several concurrent) cases
+// just ended.
 type completedRequest struct {
 	UserID string `json:"userId"`
+	CaseID string `json:"caseId"`
 }
 
 // Completed handles POST /route/completed.
@@ -162,12 +172,12 @@ func (h *RoutingHandler) Completed(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if req.UserID == "" {
-		writeError(w, http.StatusBadRequest, "userId is required.")
+	if req.UserID == "" || req.CaseID == "" {
+		writeError(w, http.StatusBadRequest, "userId and caseId are required.")
 		return
 	}
 
-	result, err := h.router.Completed(r.Context(), req.UserID)
+	result, err := h.router.Completed(r.Context(), req.UserID, req.CaseID)
 	if err != nil {
 		writeStorageError(w, "completed", err)
 		return
@@ -206,8 +216,8 @@ type acceptRequest struct {
 	CaseID string `json:"caseId"`
 }
 
-// Accept handles POST /route/accept -- confirms userId is accepting the
-// case they were assigned (PENDING -> BUSY). See router.Router.Accept's
+// Accept handles POST /route/accept -- confirms userId is accepting caseId
+// (OPEN -> ACTIVE for that one conversation). See router.Router.Accept's
 // own doc comment for when Applied comes back false instead of erroring.
 func (h *RoutingHandler) Accept(w http.ResponseWriter, r *http.Request) {
 	var req acceptRequest
@@ -227,11 +237,23 @@ func (h *RoutingHandler) Accept(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// GetPresence handles GET /route/presence/{userId}. Includes currentCase
-// (omitted when there is none) so a caller whose own UI state for a
-// pending alert or active session was lost -- a browser refresh, a closed
-// tab -- can rehydrate it instead of the engineer being stuck PENDING or
-// BUSY with nothing to act on (see router.Router.PresenceDetail).
+// presenceResponse is GetPresence's response shape -- chat_status plus
+// capacity/load and every case currently held (pending or accepted alike),
+// so a caller whose own UI state was lost can rehydrate all of it. See
+// router.PresenceDetail.
+type presenceResponse struct {
+	ChatStatus         router.Status       `json:"chatStatus"`
+	ActiveChats        int                 `json:"activeChats"`
+	MaxConcurrentChats int                 `json:"maxConcurrentChats"`
+	AtCapacity         bool                `json:"atCapacity"`
+	Cases              []router.CaseStatus `json:"cases,omitempty"`
+	// PendingTimeoutSeconds is this service's own configured threshold for
+	// any pending case in Cases -- always included since it's a constant,
+	// not per-engineer state.
+	PendingTimeoutSeconds int `json:"pendingTimeoutSeconds"`
+}
+
+// GetPresence handles GET /route/presence/{userId}.
 func (h *RoutingHandler) GetPresence(w http.ResponseWriter, r *http.Request) {
 	userID := r.PathValue("userId")
 	if userID == "" {
@@ -243,46 +265,29 @@ func (h *RoutingHandler) GetPresence(w http.ResponseWriter, r *http.Request) {
 		writeStorageError(w, "presence:get", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, struct {
-		Status      router.Status    `json:"status"`
-		CurrentCase *router.CaseInfo `json:"currentCase,omitempty"`
-		// PendingSince/PendingTimeoutSeconds let a caller's UI show a
-		// countdown to when an unaccepted PENDING case gets reassigned (see
-		// router.Router.SweepExpiredPending) -- PendingSince is nil unless
-		// Status is PENDING; PendingTimeoutSeconds is this service's own
-		// configured threshold, always included since it's a constant, not
-		// per-engineer state.
-		PendingSince          *time.Time `json:"pendingSince,omitempty"`
-		PendingTimeoutSeconds int        `json:"pendingTimeoutSeconds"`
-	}{
-		Status: detail.Status, CurrentCase: detail.CurrentCase,
-		PendingSince: detail.PendingSince, PendingTimeoutSeconds: int(h.pendingTimeout.Seconds()),
+	writeJSON(w, http.StatusOK, presenceResponse{
+		ChatStatus: detail.ChatStatus, ActiveChats: detail.ActiveChats,
+		MaxConcurrentChats: detail.MaxConcurrentChats, AtCapacity: detail.AtCapacity,
+		Cases: detail.Cases, PendingTimeoutSeconds: int(h.pendingTimeout.Seconds()),
 	})
-}
-
-// workItemRequest is the body for POST /route/workitem -- see
-// router.Router.CreateWorkItem.
-type workItemRequest struct {
-	CaseID         string `json:"caseId"`
-	CreatorEmail   string `json:"creatorEmail"`
-	Subject        string `json:"subject"`
-	InitialMessage string `json:"initialMessage"`
 }
 
 // CreateWorkItem handles POST /route/workitem -- LOCAL STAND-IN endpoint,
 // see router/workitem.go's package doc comment. Called once per escalation
-// from csm-portal/backend's HandleEscalate, regardless of routing outcome.
+// from csm-portal/backend's HandleEscalate, BEFORE Escalate itself (see
+// router.Router.CreateWorkItem's own doc comment for why the order
+// matters now).
 func (h *RoutingHandler) CreateWorkItem(w http.ResponseWriter, r *http.Request) {
-	var req workItemRequest
+	var req caseInfoRequest
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if req.CaseID == "" || req.CreatorEmail == "" || req.Subject == "" {
-		writeError(w, http.StatusBadRequest, "caseId, creatorEmail, and subject are required.")
+	if req.CaseID == "" || req.CustomerEmail == "" || req.Subject == "" {
+		writeError(w, http.StatusBadRequest, "caseId, customerEmail, and subject are required.")
 		return
 	}
 
-	if err := h.router.CreateWorkItem(r.Context(), req.CaseID, req.CreatorEmail, req.Subject, req.InitialMessage); err != nil {
+	if err := h.router.CreateWorkItem(r.Context(), req.toCaseInfo()); err != nil {
 		writeStorageError(w, "workitem:create", err)
 		return
 	}
