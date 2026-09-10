@@ -25,8 +25,18 @@ import type { JSX } from "react";
 import {
   useGetEngineerStatus,
   useSetEngineerStatus,
+  useSetMaxConcurrentChats,
   type EngineerStatus,
 } from "@features/csm-chat/api/useEngineerStatus";
+
+// Options offered in the capacity dropdown below. chat-routing-service's
+// own CHECK constraint allows 1-20 (see cs_engineer_status.
+// max_concurrent_chats), but a support engineer realistically juggling
+// more than 10 simultaneous live chats is not a scenario this pass needs
+// to design for -- capping the dropdown at 10 keeps the menu short. An
+// engineer who genuinely needs more can still be set higher via a manual
+// DB update, same as any value outside this list before this UI existed.
+const CAPACITY_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 // Display info for every status. All three are directly selectable now
 // (see the 2026-09-10 concurrent-chat-capacity change): chat_status is a
@@ -59,26 +69,39 @@ const SELECTABLE_STATUSES: { value: EngineerStatus; label: string; color: string
  * flight, so the dropdown never flashes an incorrect Available state.
  *
  * Also shows this engineer's current concurrent-chat load next to the
- * dropdown (e.g. "2/3") whenever their capacity is above the default of
- * one, or they're currently holding at least one case -- purely
- * informational, there is no control here to change max_concurrent_chats
- * itself (see EngineerPresence.maxConcurrentChats's own doc comment on why
- * that's still a manual DB change, not a UI setting, in this pass).
+ * status dropdown (e.g. "2/3"), and a second small dropdown to change their
+ * own max_concurrent_chats (see useSetMaxConcurrentChats) -- this replaces
+ * the manual pgAdmin `UPDATE cs_engineer_status` that was previously the
+ * only way to raise an engineer's limit above the default of one.
  */
 export default function EngineerStatusMenu(): JSX.Element {
   const { data: presence } = useGetEngineerStatus();
   const setStatus = useSetEngineerStatus();
+  const setMaxConcurrentChats = useSetMaxConcurrentChats();
 
   const current: EngineerStatus = presence?.chatStatus ?? "OFFLINE";
   const currentOption = STATUS_DISPLAY[current];
   const activeChats = presence?.activeChats ?? 0;
   const maxConcurrentChats = presence?.maxConcurrentChats ?? 1;
   const showLoad = maxConcurrentChats > 1 || activeChats > 0;
+  // The dropdown must always include the engineer's actual current value,
+  // even if it's outside CAPACITY_OPTIONS's 1-10 range (set via a manual DB
+  // update before this UI existed, or a future admin tool) -- otherwise
+  // MUI's Select would render blank instead of showing what's really set.
+  const capacityOptions = CAPACITY_OPTIONS.includes(maxConcurrentChats)
+    ? CAPACITY_OPTIONS
+    : [...CAPACITY_OPTIONS, maxConcurrentChats].sort((a, b) => a - b);
 
   const handleChange = (e: SelectChangeEvent<string>): void => {
     const next = e.target.value as EngineerStatus;
     if (next === current) return;
     setStatus.mutate(next);
+  };
+
+  const handleCapacityChange = (e: SelectChangeEvent<string>): void => {
+    const next = Number(e.target.value);
+    if (next === maxConcurrentChats) return;
+    setMaxConcurrentChats.mutate(next);
   };
 
   return (
@@ -141,9 +164,30 @@ export default function EngineerStatusMenu(): JSX.Element {
       </Select>
       {showLoad && (
         <Typography variant="caption" color="text.secondary" sx={{ fontSize: "0.75rem" }}>
-          {activeChats}/{maxConcurrentChats}
+          {activeChats}/
         </Typography>
       )}
+      <Select
+        value={String(maxConcurrentChats)}
+        onChange={handleCapacityChange}
+        size="small"
+        variant="standard"
+        disableUnderline
+        aria-label="Set your max concurrent chats"
+        disabled={setMaxConcurrentChats.isPending}
+        sx={{
+          minWidth: 36,
+          fontSize: "0.75rem",
+          color: "text.secondary",
+          "& .MuiSelect-select": { py: 0.25, pr: "20px !important" },
+        }}
+      >
+        {capacityOptions.map((n) => (
+          <MenuItem key={n} value={String(n)} sx={{ fontSize: "0.8125rem" }}>
+            {n}
+          </MenuItem>
+        ))}
+      </Select>
     </Box>
   );
 }

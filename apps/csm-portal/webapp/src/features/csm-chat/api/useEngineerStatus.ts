@@ -181,3 +181,36 @@ export function useSetEngineerStatus(): UseMutationResult<
     },
   });
 }
+
+/**
+ * Sets the authenticated engineer's own configurable concurrent-chat
+ * capacity: PATCH /engineers/me/capacity (see csm-portal/backend's
+ * internal/handler/chat.go HandleSetMaxConcurrentChats). Replaces the
+ * manual pgAdmin `UPDATE cs_engineer_status` this previously required (see
+ * the project's db-schema-review-2026-09-07-outcomes.md) -- added
+ * alongside the 2026-09-10 queue-abandonment fix so an engineer can raise
+ * their own limit from EngineerStatusMenu's dropdown instead of asking for
+ * a manual DB change.
+ *
+ * Lowering the limit below the engineer's current active-chat count never
+ * drops an in-progress chat -- it only stops new work from routing to them
+ * until they fall back under it (see that handler's own doc comment) -- so
+ * this invalidates the same status query rather than needing any special
+ * handling for a lowered value.
+ */
+export function useSetMaxConcurrentChats(): UseMutationResult<
+  { applied: boolean },
+  Error,
+  number
+> {
+  const api = useBackendApi();
+  const queryClient = useQueryClient();
+
+  return useMutation<{ applied: boolean }, Error, number>({
+    mutationFn: (maxConcurrentChats) =>
+      api.patch("/engineers/me/capacity", { maxConcurrentChats }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ENGINEER_STATUS_QUERY_KEY });
+    },
+  });
+}

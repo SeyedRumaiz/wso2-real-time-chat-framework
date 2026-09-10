@@ -149,8 +149,17 @@ type routingService interface {
 	GetPresence(ctx context.Context, userID string) (routingclient.PresenceDetail, error)
 	// SweepTimeouts is polled periodically by ChatHandler.StartTimeoutSweeper
 	// (see that method's doc comment) -- not called from any HTTP handler in
-	// this file directly.
-	SweepTimeouts(ctx context.Context) ([]routingclient.TimeoutResult, error)
+	// this file directly. Returns both PENDING-accept timeouts and
+	// queue-abandonment results (see routingclient.SweepResult) -- the
+	// 2026-09-10 fix for stale, never-assigned escalations sitting in the
+	// queue forever and later ambushing whichever engineer next went
+	// AVAILABLE (see that type's own doc comment).
+	SweepTimeouts(ctx context.Context) (routingclient.SweepResult, error)
+	// SetMaxConcurrentChats lets an engineer set their own configurable
+	// concurrent-chat capacity (see HandleSetMaxConcurrentChats) -- added
+	// alongside the queue-abandonment fix above so raising a specific
+	// engineer's limit no longer requires a manual DB UPDATE.
+	SetMaxConcurrentChats(ctx context.Context, userID string, max int) error
 	// CreateWorkItem and AddComment are LOCAL STAND-IN persistence calls
 	// (see routingclient.Client.CreateWorkItem's doc comment and the
 	// project's chat-persistence-mapping-plan.md) -- they exist only until
@@ -759,6 +768,62 @@ func (h *ChatHandler) HandleGetPresence(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSONValue(w, http.StatusOK, detail)
+}
+
+// setMaxConcurrentChatsRequest is the body an engineer's browser sends for
+// PATCH /engineers/me/capacity.
+type setMaxConcurrentChatsRequest struct {
+	MaxConcurrentChats int `json:"maxConcurrentChats"`
+}
+
+// minMaxConcurrentChats/maxMaxConcurrentChats mirror chat-routing-service's
+// own cs_engineer_status.max_concurrent_chats CHECK constraint (see that
+// service's migrations/000018_concurrent_chat_capacity.up.sql) -- checked
+// here too so an out-of-range value gets a clean 400 from this browser-
+// facing endpoint instead of a raw upstream error surfacing as a 502.
+const (
+	minMaxConcurrentChats = 1
+	maxMaxConcurrentChats = 20
+)
+
+// HandleSetMaxConcurrentChats handles PATCH /engineers/me/capacity —
+// browser-facing, behind Auth. Lets an engineer set their own configurable
+// concurrent-chat capacity (see internal/routingclient.Client.
+// SetMaxConcurrentChats and chat-routing-service's router.Router.
+// SetMaxConcurrentChats), replacing the manual pgAdmin `UPDATE
+// cs_engineer_status` this previously required (see the project's
+// db-schema-review-2026-09-07-outcomes.md). Deliberately does not disturb
+// any case the engineer already holds -- lowering the limit below their
+// current active count just stops new work from routing to them until
+// they fall back under it, it never drops an in-progress chat.
+func (h *ChatHandler) HandleSetMaxConcurrentChats(w http.ResponseWriter, r *http.Request) {
+	user := middleware.UserInfoFromContext(r.Context())
+	if user == nil {
+		writeError(w, http.StatusUnauthorized, ErrMsgUnauthorized)
+		return
+	}
+
+	body, ok := readChatBody(w, r)
+	if !ok {
+		return
+	}
+	var req setMaxConcurrentChatsRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+		return
+	}
+	if req.MaxConcurrentChats < minMaxConcurrentChats || req.MaxConcurrentChats > maxMaxConcurrentChats {
+		writeError(w, http.StatusBadRequest, "maxConcurrentChats must be between 1 and 20.")
+		return
+	}
+
+	if err := h.routing.SetMaxConcurrentChats(r.Context(), user.UserID, req.MaxConcurrentChats); err != nil {
+		slog.ErrorContext(r.Context(), "chat: routing service set max concurrent chats failed", "userID", user.UserID, "err", err)
+		writeError(w, http.StatusBadGateway, "Failed to update your chat capacity. Please try again.")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []byte(`{"applied":true}`))
 }
 
 // declineSessionRequest is the body an engineer's browser sends for

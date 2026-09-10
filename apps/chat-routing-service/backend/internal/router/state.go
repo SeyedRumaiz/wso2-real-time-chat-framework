@@ -497,6 +497,45 @@ func (r *Router) GetPresence(ctx context.Context, userID string) (PresenceDetail
 	}, nil
 }
 
+// ErrInvalidCapacity is returned by SetMaxConcurrentChats when max is
+// outside cs_engineer_status.max_concurrent_chats's own CHECK constraint
+// (1-20) -- checked here too so a caller gets a clean, typed rejection
+// instead of a raw constraint-violation error from Postgres.
+var ErrInvalidCapacity = errors.New("max_concurrent_chats must be between 1 and 20")
+
+// SetMaxConcurrentChats sets userID's configurable concurrent-chat
+// capacity, creating their row (defaulting to OFFLINE, capacity 1) on
+// first contact just like SetPresence does. This is the admin-facing
+// counterpart to the manual `UPDATE cs_engineer_status` every engineer's
+// capacity change went through before this existed (see the project's
+// db-schema-review-2026-09-07-outcomes.md) -- now exposed so an engineer
+// can set their own limit from the CSM portal's status menu.
+//
+// Deliberately does not touch any case the engineer already holds:
+// lowering the limit below their current active count doesn't drop
+// anything already assigned -- it just stops new work from routing to
+// them (via popAvailableEngineer/SetPresence's queue-drain, both of which
+// compare against this same column) until they fall back under it.
+func (r *Router) SetMaxConcurrentChats(ctx context.Context, userID string, max int) error {
+	if max < 1 || max > 20 {
+		return ErrInvalidCapacity
+	}
+	return r.withTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO cs_engineer_status (user_id) VALUES ($1)
+			ON CONFLICT (user_id) DO NOTHING
+		`, userID); err != nil {
+			return fmt.Errorf("ensure engineer row: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE cs_engineer_status SET max_concurrent_chats = $1, updated_at = now() WHERE user_id = $2
+		`, max, userID); err != nil {
+			return fmt.Errorf("set max_concurrent_chats: %w", err)
+		}
+		return nil
+	})
+}
+
 // pgxQuerier is the subset of *pgxpool.Pool that engineerCases needs --
 // satisfied directly by *pgxpool.Pool, declared here just to name the
 // dependency.

@@ -22,6 +22,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -35,16 +36,21 @@ const maxBodyBytes = 64 << 10 // 64 KiB
 
 // RoutingHandler adapts HTTP requests to router.Router calls.
 type RoutingHandler struct {
-	router         *router.Router
-	pendingTimeout time.Duration
+	router              *router.Router
+	pendingTimeout      time.Duration
+	queueAbandonTimeout time.Duration
 }
 
 // NewRoutingHandler constructs a RoutingHandler over r. pendingTimeout is
 // how long a conversation can sit assigned-but-unconfirmed before
 // SweepTimeouts reassigns/requeues it -- see router.Router.
 // SweepExpiredPending and cmd/server/main.go's PENDING_TIMEOUT_SECONDS.
-func NewRoutingHandler(r *router.Router, pendingTimeout time.Duration) *RoutingHandler {
-	return &RoutingHandler{router: r, pendingTimeout: pendingTimeout}
+// queueAbandonTimeout is how long a case can sit WAITING_FOR_ENGINEER
+// (never assigned to anyone at all) before SweepTimeouts gives up on it --
+// see router.Router.SweepAbandonedQueue and cmd/server/main.go's
+// QUEUE_ABANDON_SECONDS.
+func NewRoutingHandler(r *router.Router, pendingTimeout, queueAbandonTimeout time.Duration) *RoutingHandler {
+	return &RoutingHandler{router: r, pendingTimeout: pendingTimeout, queueAbandonTimeout: queueAbandonTimeout}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -355,6 +361,15 @@ func (h *RoutingHandler) DebugState(w http.ResponseWriter, r *http.Request) {
 // csm-portal/backend rather than run as this process's own ticker, so the
 // component that owns the engineer SSE hub is also the one deciding when
 // to look and delivering whatever this returns.
+//
+// Runs both maintenance sweeps in one call, one tick apart from the other:
+// SweepExpiredPending (an assigned-but-unconfirmed case, per-engineer) and
+// SweepAbandonedQueue (a case never assigned to anyone at all, sitting in
+// the waiting queue -- see that method's own doc comment on why this
+// exists). Combined into the existing poll rather than a second endpoint/
+// ticker, since csm-portal/backend already polls this one every
+// ENGINEER_TIMEOUT_SWEEP_INTERVAL_SECONDS and abandonment is just another
+// flavor of "something has been sitting too long."
 func (h *RoutingHandler) SweepTimeouts(w http.ResponseWriter, r *http.Request) {
 	results, err := h.router.SweepExpiredPending(r.Context(), h.pendingTimeout)
 	if err != nil {
@@ -364,7 +379,49 @@ func (h *RoutingHandler) SweepTimeouts(w http.ResponseWriter, r *http.Request) {
 	if results == nil {
 		results = []router.TimeoutResult{}
 	}
+
+	abandoned, err := h.router.SweepAbandonedQueue(r.Context(), h.queueAbandonTimeout)
+	if err != nil {
+		writeStorageError(w, "sweep-timeouts:abandoned", err)
+		return
+	}
+	if abandoned == nil {
+		abandoned = []router.AbandonedResult{}
+	}
+
 	writeJSON(w, http.StatusOK, struct {
-		Results []router.TimeoutResult `json:"results"`
-	}{Results: results})
+		Results   []router.TimeoutResult   `json:"results"`
+		Abandoned []router.AbandonedResult `json:"abandoned"`
+	}{Results: results, Abandoned: abandoned})
+}
+
+// capacityRequest is the body for PATCH /route/capacity.
+type capacityRequest struct {
+	UserID             string `json:"userId"`
+	MaxConcurrentChats int    `json:"maxConcurrentChats"`
+}
+
+// SetCapacity handles PATCH /route/capacity -- lets an engineer set their
+// own configurable concurrent-chat capacity (see router.Router.
+// SetMaxConcurrentChats), replacing the manual `UPDATE cs_engineer_status`
+// this previously required.
+func (h *RoutingHandler) SetCapacity(w http.ResponseWriter, r *http.Request) {
+	var req capacityRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "userId is required.")
+		return
+	}
+
+	if err := h.router.SetMaxConcurrentChats(r.Context(), req.UserID, req.MaxConcurrentChats); err != nil {
+		if errors.Is(err, router.ErrInvalidCapacity) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeStorageError(w, "capacity:set", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"applied": true})
 }

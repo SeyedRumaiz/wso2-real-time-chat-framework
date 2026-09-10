@@ -72,9 +72,20 @@ func main() {
 	r := router.NewRouter(pool)
 
 	// how long an engineer can sit PENDING before sweep-timeouts reassigns
-	// the case and marks the engineer OFFLINE
+	// the case (their own chat_status is untouched -- see the 2026-09-10
+	// concurrent-chat-capacity change; this comment used to say it also
+	// marked the engineer OFFLINE, which stopped being true then)
 	pendingTimeout := envDurationSeconds("PENDING_TIMEOUT_SECONDS", 90)
-	h := handler.NewRoutingHandler(r, pendingTimeout)
+	// how long a case can sit WAITING_FOR_ENGINEER (never assigned to
+	// anyone at all -- every engineer OFFLINE/BUSY/at capacity when it
+	// arrived) before sweep-timeouts gives up on it -- see router.Router.
+	// SweepAbandonedQueue's own doc comment for why this exists. Default
+	// of 30 minutes is deliberately much longer than PENDING_TIMEOUT_
+	// SECONDS: that one bounds a single engineer's accept window, this one
+	// bounds how long a customer should realistically keep waiting with
+	// nobody free at all.
+	queueAbandonTimeout := envDurationSeconds("QUEUE_ABANDON_SECONDS", 1800)
+	h := handler.NewRoutingHandler(r, pendingTimeout, queueAbandonTimeout)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /route/escalate", h.Escalate)
@@ -83,6 +94,7 @@ func main() {
 	mux.HandleFunc("POST /route/decline", h.Decline)
 	mux.HandleFunc("POST /route/accept", h.Accept)
 	mux.HandleFunc("GET /route/presence/{userId}", h.GetPresence)
+	mux.HandleFunc("PATCH /route/capacity", h.SetCapacity)
 	// stand-in persistence endpoints until real persistence lands
 	mux.HandleFunc("POST /route/workitem", h.CreateWorkItem)
 	mux.HandleFunc("POST /route/comment", h.AddComment)

@@ -181,3 +181,133 @@ func (r *Router) timeoutOne(ctx context.Context, userID, caseID string, timeout 
 	}
 	return result, nil
 }
+
+// AbandonedResult is one case SweepAbandonedQueue gave up on -- it sat in
+// chat_queue as WAITING_FOR_ENGINEER (never assigned to anyone at all,
+// unlike TimeoutResult's PENDING-but-unconfirmed case) for longer than the
+// configured abandon timeout.
+type AbandonedResult struct {
+	CaseID         string `json:"caseId"`
+	ConversationID string `json:"conversationId"`
+}
+
+// abandonedCandidate is one row from SweepAbandonedQueue's initial,
+// unlocked scan -- re-verified under lock by abandonOne before anything
+// changes, mirroring pendingCandidate/timeoutOne's own pattern.
+type abandonedCandidate struct {
+	conversationID string
+}
+
+// SweepAbandonedQueue finds every chat_queue row that has been sitting
+// WAITING_FOR_ENGINEER (i.e. never handed to any engineer at all) for at
+// least timeout, and gives up on each one: its chat_queue row is deleted
+// and the underlying chat_conversation is marked session_ended_at, so it
+// can never be silently claimed later.
+//
+// This closes a real gap the PENDING-timeout sweep (SweepExpiredPending)
+// doesn't cover: that one only handles a case that WAS assigned to a
+// specific engineer and never confirmed. A case that was never assigned to
+// anyone in the first place (every engineer was OFFLINE/BUSY/at capacity
+// when it arrived) had no expiry at all before this -- it would sit in the
+// queue indefinitely, and whichever engineer next went AVAILABLE would
+// silently claim it via SetPresence's own queue-drain. From that
+// engineer's point of view this looks exactly like a fresh
+// "customer_escalation" event despite no customer having done anything
+// just now, and it also consumes one unit of their concurrent-chat
+// capacity -- which is why a customer escalating for real right after
+// could end up queued instead of routed directly to an apparently-idle
+// AVAILABLE engineer. See TestRepro_StaleQueuedCaseAmbushesNextAvailable
+// Engineer for a reproduction of exactly this against a real database.
+//
+// Meant to be polled periodically alongside SweepExpiredPending (see
+// csm-portal/backend's ChatHandler.StartTimeoutSweeper) -- this package
+// has no background loop of its own. Each call is a snapshot; a case that
+// crosses the timeout between two calls is simply picked up next time.
+func (r *Router) SweepAbandonedQueue(ctx context.Context, timeout time.Duration) ([]AbandonedResult, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT chat_conversation_id FROM chat_queue
+		WHERE status = 'WAITING_FOR_ENGINEER' AND created_at < now() - make_interval(secs => $1)
+	`, timeout.Seconds())
+	if err != nil {
+		return nil, fmt.Errorf("router: scan abandoned queue rows: %w", err)
+	}
+	var candidates []abandonedCandidate
+	for rows.Next() {
+		var c abandonedCandidate
+		if err := rows.Scan(&c.conversationID); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("router: scan abandoned queue row: %w", err)
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("router: scan abandoned queue rows: %w", err)
+	}
+
+	var results []AbandonedResult
+	for _, c := range candidates {
+		result, err := r.abandonOne(ctx, c.conversationID, timeout)
+		if err != nil {
+			return results, fmt.Errorf("router: abandon %s: %w", c.conversationID, err)
+		}
+		if result != nil {
+			results = append(results, *result)
+		}
+	}
+	return results, nil
+}
+
+// abandonOne re-verifies and applies a single queue row's abandonment
+// inside its own transaction, the same re-check-under-lock pattern
+// timeoutOne uses: the row may have been claimed (by a queue-drain) or
+// accepted in the moment between SweepAbandonedQueue's unlocked scan and
+// this lock, in which case this is a no-op (nil, nil) rather than
+// abandoning a case an engineer is now legitimately holding.
+func (r *Router) abandonOne(ctx context.Context, conversationID string, timeout time.Duration) (*AbandonedResult, error) {
+	var result *AbandonedResult
+	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		var (
+			caseInfoJSON []byte
+			status       queueStatus
+			createdAt    time.Time
+		)
+		err := tx.QueryRow(ctx, `
+			SELECT case_info, status, created_at FROM chat_queue
+			WHERE chat_conversation_id = $1
+			FOR UPDATE
+		`, conversationID).Scan(&caseInfoJSON, &status, &createdAt)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			return nil
+		case err != nil:
+			return fmt.Errorf("lock queue row: %w", err)
+		}
+		if status != queueWaitingForEngineer || time.Since(createdAt) < timeout {
+			return nil
+		}
+
+		var c CaseInfo
+		if caseInfoJSON != nil {
+			if err := json.Unmarshal(caseInfoJSON, &c); err != nil {
+				return fmt.Errorf("decode case info: %w", err)
+			}
+		}
+
+		if _, err := tx.Exec(ctx, `DELETE FROM chat_queue WHERE chat_conversation_id = $1`, conversationID); err != nil {
+			return fmt.Errorf("delete abandoned queue row: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE chat_conversation SET session_ended_at = now(), updated_at = now()
+			WHERE case_id = $1 AND session_ended_at IS NULL
+		`, c.CaseID); err != nil {
+			return fmt.Errorf("mark abandoned conversation ended: %w", err)
+		}
+
+		result = &AbandonedResult{CaseID: c.CaseID, ConversationID: conversationID}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}

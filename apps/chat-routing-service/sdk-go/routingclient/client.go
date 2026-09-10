@@ -394,18 +394,54 @@ func (c *Client) GetPresence(ctx context.Context, userID string) (PresenceDetail
 	return out, nil
 }
 
+// AbandonedResult mirrors router.AbandonedResult -- one case SweepTimeouts
+// gave up on because it sat WAITING_FOR_ENGINEER (never assigned to anyone
+// at all) past chat-routing-service's own configured QUEUE_ABANDON_SECONDS.
+// Distinct from TimeoutResult, which covers a case that WAS assigned to a
+// specific engineer and never confirmed -- see router.Router.
+// SweepAbandonedQueue's own doc comment for why this second, longer-fused
+// sweep exists: without it, an old queued escalation nobody was ever free
+// to take could sit forever and later be silently claimed by whichever
+// engineer next went AVAILABLE.
+type AbandonedResult struct {
+	CaseID         string `json:"caseId"`
+	ConversationID string `json:"conversationId"`
+}
+
+// SweepResult is SweepTimeouts's result: every case reassigned/requeued
+// for a PENDING-accept timeout, plus every case abandoned for having
+// waited too long with nobody ever free to take it.
+type SweepResult struct {
+	Timeouts  []TimeoutResult   `json:"results"`
+	Abandoned []AbandonedResult `json:"abandoned"`
+}
+
 // SweepTimeouts calls POST /route/sweep-timeouts, asking the routing
-// service to reassign or requeue any case whose assigned engineer has been
-// PENDING (assigned, not yet accepted) past that service's own configured
-// PENDING_TIMEOUT_SECONDS. Meant to be polled periodically by whichever
-// caller owns delivering the result to the newly-assigned engineer (see
-// apps/csm-portal/backend/internal/handler's ChatHandler.
-// StartTimeoutSweeper) -- this service never pushes anything itself, see
-// this package's own "Synchronous HTTP only" design note above.
-func (c *Client) SweepTimeouts(ctx context.Context) ([]TimeoutResult, error) {
-	var out struct {
-		Results []TimeoutResult `json:"results"`
-	}
+// service to (a) reassign or requeue any case whose assigned engineer has
+// been PENDING (assigned, not yet accepted) past that service's own
+// configured PENDING_TIMEOUT_SECONDS, and (b) give up on any case that's
+// been waiting in the queue with nobody ever free to take it past
+// QUEUE_ABANDON_SECONDS (see AbandonedResult). Meant to be polled
+// periodically by whichever caller owns delivering the result to the
+// newly-assigned engineer (see apps/csm-portal/backend/internal/handler's
+// ChatHandler.StartTimeoutSweeper) -- this service never pushes anything
+// itself, see this package's own "Synchronous HTTP only" design note
+// above.
+func (c *Client) SweepTimeouts(ctx context.Context) (SweepResult, error) {
+	var out SweepResult
 	err := c.do(ctx, http.MethodPost, "/route/sweep-timeouts", nil, &out)
-	return out.Results, err
+	return out, err
+}
+
+// SetMaxConcurrentChats calls PATCH /route/capacity, setting userID's
+// configurable concurrent-chat capacity (see router.Router.
+// SetMaxConcurrentChats). max must be between 1 and 20 inclusive -- an
+// out-of-range value gets a 400 from that endpoint, surfaced here as a
+// plain error.
+func (c *Client) SetMaxConcurrentChats(ctx context.Context, userID string, max int) error {
+	body := struct {
+		UserID             string `json:"userId"`
+		MaxConcurrentChats int    `json:"maxConcurrentChats"`
+	}{UserID: userID, MaxConcurrentChats: max}
+	return c.do(ctx, http.MethodPatch, "/route/capacity", body, nil)
 }

@@ -56,33 +56,49 @@ func (h *ChatHandler) StartTimeoutSweeper(ctx context.Context, interval time.Dur
 // means this tick found nothing to do from this handler's point of view —
 // chat-routing-service itself is unaffected, and the next tick tries again.
 func (h *ChatHandler) sweepTimeoutsOnce(ctx context.Context) {
-	results, err := h.routing.SweepTimeouts(ctx)
+	result, err := h.routing.SweepTimeouts(ctx)
 	if err != nil {
 		slog.ErrorContext(ctx, "chat: timeout sweep failed", "err", err)
 		return
 	}
-	for _, result := range results {
+	for _, timeout := range result.Timeouts {
 		slog.InfoContext(ctx, "chat: engineer timed out on pending case",
-			"userID", result.UserID, "caseId", result.CaseID,
-			"reassignedTo", result.ReassignedTo, "requeued", result.Requeued)
+			"userID", timeout.UserID, "caseId", timeout.CaseID,
+			"reassignedTo", timeout.ReassignedTo, "requeued", timeout.Requeued)
 
 		// Tell the unresponsive engineer's own browser their stale pending
-		// alert is gone. NOTE: the frontend does not yet have a handler for
-		// this "case_timed_out" event type -- EngineerAlertNotification.tsx
-		// needs a small follow-up to clear/relabel the card on this event,
-		// the same way it already does for handleComplete/handleDismiss.
-		// Until then this event is harmless but inert on the receiving
-		// browser (an unrecognised type is simply ignored) -- it does not
-		// block the reassignment below, which is the part that actually
-		// matters for the customer.
-		h.publishToEngineer(result.UserID, chatEvent{
+		// alert is gone. EngineerAlertNotification.tsx now handles this
+		// event type (clears the pending card) -- see that component's
+		// handleAlert "case_timed_out" case.
+		h.publishToEngineer(timeout.UserID, chatEvent{
 			Type:      "case_timed_out",
-			CaseID:    result.CaseID,
+			CaseID:    timeout.CaseID,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
 
-		if result.ReassignedTo != "" && result.AssignedCase != nil {
-			h.publishToEngineer(result.ReassignedTo, assignedCaseEvent(*result.AssignedCase))
+		if timeout.ReassignedTo != "" && timeout.AssignedCase != nil {
+			h.publishToEngineer(timeout.ReassignedTo, assignedCaseEvent(*timeout.AssignedCase))
 		}
+	}
+
+	// Queue-abandonment results (2026-09-10 fix): a case that sat
+	// WAITING_FOR_ENGINEER -- never assigned to anyone at all -- past
+	// chat-routing-service's own QUEUE_ABANDON_SECONDS. Nobody on the
+	// engineer side ever saw this case (it was never delivered), so there
+	// is no engineer-facing event to clear here -- only the customer might
+	// still have a tab open waiting on it. Best-effort notify backend-v2 so
+	// a still-open customer chat can show a "no engineer was available"
+	// message instead of waiting forever; a customer who already left sees
+	// nothing, which is no worse than today.
+	for _, abandoned := range result.Abandoned {
+		slog.InfoContext(ctx, "chat: abandoned a case that waited too long with no engineer free",
+			"caseId", abandoned.CaseID, "conversationId", abandoned.ConversationID)
+		h.notifyBackendV2(ctx, chatEvent{
+			Type:           "chat_abandoned",
+			CaseID:         abandoned.CaseID,
+			ConversationID: abandoned.ConversationID,
+			Message:        "No engineer was available to take this chat. Please try again.",
+			Timestamp:      time.Now().UTC().Format(time.RFC3339),
+		})
 	}
 }

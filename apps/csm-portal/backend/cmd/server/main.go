@@ -304,6 +304,7 @@ func main() {
 	mux.HandleFunc("POST /chat/sessions/{id}/decline", chatHandler.HandleDeclineSession)
 	mux.HandleFunc("POST /engineers/me/status", chatHandler.HandleSetPresence)
 	mux.HandleFunc("GET /engineers/me/status", chatHandler.HandleGetPresence)
+	mux.HandleFunc("PATCH /engineers/me/capacity", chatHandler.HandleSetMaxConcurrentChats)
 
 	// Built once and reused on both listeners below: Auth() does a real JWKS
 	// fetch (when TokenValidatorEnabled), so calling it a second time would
