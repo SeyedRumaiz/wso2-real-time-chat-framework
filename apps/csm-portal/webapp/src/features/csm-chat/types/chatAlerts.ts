@@ -24,10 +24,12 @@ export type ChatAlertType =
   | "customer_message"
   | "session_closed"
   // Sent to the ENGINEER who was PENDING on a case past chat-routing-
-  // service's PENDING_TIMEOUT_SECONDS and never accepted it -- their case
-  // was reassigned/requeued and they were taken OFFLINE server-side (see
-  // that service's router.Router.SweepExpiredPending). Only caseId and
-  // timestamp are set.
+  // service's PENDING_TIMEOUT_SECONDS and never accepted it -- that one
+  // case was reassigned/requeued (see that service's router.Router.
+  // SweepExpiredPending). Only this specific case is affected -- as of the
+  // 2026-09-10 concurrent-chat-capacity change, the engineer's chat_status
+  // and any other concurrent case they hold are left untouched. Only
+  // caseId and timestamp are set.
   | "case_timed_out";
 
 export type ChatAlertEvent = {

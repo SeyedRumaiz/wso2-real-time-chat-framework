@@ -35,12 +35,13 @@ export interface CompleteChatSessionInput {
  * state — resolving the underlying issue is still a separate, explicit step
  * on the normal case detail page.
  *
- * This also releases the engineer's routing-service capacity server-side
- * (back to AVAILABLE, or OFFLINE if they'd set pendingOffline) — but the
- * response here doesn't say which, so the status dropdown's own query is
- * invalidated rather than optimistically set, letting it refetch the real
- * outcome instead of going stale showing BUSY forever (a session only
- * reaches this call once already accepted, i.e. BUSY, not PENDING).
+ * This also releases the engineer's routing-service capacity for this one
+ * case server-side (see the 2026-09-10 concurrent-chat-capacity change --
+ * chat_status itself is untouched, since it's now a plain manual toggle
+ * independent of case load) — but the response here doesn't say whether
+ * that immediately backfilled another queued case, so the status/case-list
+ * query is invalidated rather than optimistically set, letting it refetch
+ * the real outcome instead of going stale.
  */
 export function useCompleteChatSession(): UseMutationResult<
   { message: string },

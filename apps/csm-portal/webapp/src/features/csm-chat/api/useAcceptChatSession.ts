@@ -30,16 +30,18 @@ export interface AcceptChatSessionInput {
 /**
  * Accepts a live-engineer-chat session: POST /chat/sessions/{caseId}/accept
  * (see csm-portal/backend's internal/handler/chat.go HandleAcceptSession).
- * Assigns the case to the calling engineer (confirmed server-side via
- * router.Router.Accept's PENDING -> BUSY check) and notifies both the other
- * connected engineers and the customer's chat.
+ * Confirms the case to the calling engineer server-side (that one
+ * conversation moves OPEN -> ACTIVE, see router.Router.Accept) and notifies
+ * both the other connected engineers and the customer's chat. Deliberately
+ * does not touch chat_status (see the 2026-09-10 concurrent-chat-capacity
+ * change) -- any other concurrent case this engineer holds is unaffected.
  *
- * Invalidates the status dropdown's query on success, matching
+ * Invalidates the status/case-list query on success, matching
  * useCompleteChatSession/useDeclineChatSession/useSetEngineerStatus's own
- * pattern -- without this, the dropdown kept showing PENDING (its cached
+ * pattern -- without this, this case kept showing as pending (its cached
  * value from when the alert first arrived, see EngineerAlertNotification's
  * handleAlert) for the entire chat, since nothing ever told it to refetch
- * the BUSY status this call itself just caused server-side.
+ * the now-accepted state this call itself just caused server-side.
  */
 export function useAcceptChatSession(): UseMutationResult<
   { message: string },

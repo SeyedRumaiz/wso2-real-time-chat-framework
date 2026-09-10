@@ -23,12 +23,18 @@ import {
 } from "@tanstack/react-query";
 import { useBackendApi } from "@api/backend/client";
 
-export type EngineerStatus = "AVAILABLE" | "PENDING" | "BUSY" | "OFFLINE";
+// AVAILABLE/BUSY/OFFLINE are all directly requestable now (see
+// useSetEngineerStatus) -- chat_status is a plain manual toggle,
+// independent of how many cases the engineer is actually holding (see the
+// 2026-09-10 concurrent-chat-capacity change). There is no PENDING here:
+// "pending" (assigned, not yet accepted) is a per-case fact now -- see
+// EngineerCase.pending -- never a top-level engineer status.
+export type EngineerStatus = "AVAILABLE" | "BUSY" | "OFFLINE";
 
 // Mirrors chat-routing-service's router.CaseInfo / csm-portal/backend's
 // routingclient.CaseInfo. Only the fields this feature's UI actually reads
 // are declared.
-export interface EngineerCurrentCase {
+export interface EngineerCaseInfo {
   caseId: string;
   conversationId: string;
   subject?: string;
@@ -37,23 +43,42 @@ export interface EngineerCurrentCase {
   message?: string;
 }
 
+// Mirrors router.CaseStatus / routingclient.CaseStatus -- one case the
+// engineer currently holds, pending or accepted alike. Replaces the old
+// single EngineerCurrentCase/pendingSince pair on EngineerPresence now that
+// an engineer can hold more than one case at once.
+export interface EngineerCase extends EngineerCaseInfo {
+  // False once Accept confirms this specific case -- mirrors the old
+  // status === "PENDING" check, now evaluated per case rather than per
+  // engineer.
+  pending: boolean;
+  // ISO 8601 -- when this case was assigned to this engineer (not when
+  // created). Drives EngineerAlertNotification's per-case accept countdown
+  // while pending, same as the old top-level pendingSince.
+  assignedAt: string;
+}
+
 export interface EngineerPresence {
-  status: EngineerStatus;
-  // Set when status is PENDING or BUSY (see HandleGetPresence). Lets a
-  // caller rehydrate a lost pending alert or active session's local widget
-  // state after losing it client-side (a refresh, a closed tab) — see
-  // EngineerAlertNotification, which is the reason this was added: without
-  // it, an engineer who's genuinely still PENDING/BUSY server-side has
-  // nothing left in the UI to act on.
-  currentCase?: EngineerCurrentCase;
-  // ISO 8601 — set only when status is PENDING: when this engineer was
-  // assigned currentCase. Lets EngineerAlertNotification resume an
-  // accurate accept-countdown after a refresh instead of restarting it
-  // from the full duration.
-  pendingSince?: string;
+  chatStatus: EngineerStatus;
+  // How many of the cases below are still open (state OPEN or ACTIVE,
+  // session not yet ended) -- i.e. cases.length, kept as its own field
+  // since the backend already computes it and it's the number the header
+  // dropdown displays (see EngineerStatusMenu).
+  activeChats: number;
+  // This engineer's configurable concurrent-chat capacity (see
+  // cs_engineer_status.max_concurrent_chats) -- default 1, no admin UI yet
+  // to change it (a manual DB update, see the project's
+  // db-schema-review-2026-09-07-outcomes.md).
+  maxConcurrentChats: number;
+  atCapacity: boolean;
+  // Every case this engineer currently holds, pending or accepted alike --
+  // lets EngineerAlertNotification rehydrate all of them after losing its
+  // own local state (a refresh, a closed tab) instead of the engineer
+  // being stuck with nothing left in the UI to act on.
+  cases: EngineerCase[];
   // chat-routing-service's configured PENDING_TIMEOUT_SECONDS — always
-  // present (a constant, not per-engineer state), used as the countdown's
-  // total duration.
+  // present (a constant, not per-engineer state), used as the per-case
+  // countdown's total duration.
   pendingTimeoutSeconds: number;
 }
 
@@ -70,19 +95,27 @@ export const ENGINEER_STATUS_QUERY_KEY = ["engineer-status"] as const;
 // ever changes.
 export const DEFAULT_PENDING_TIMEOUT_SECONDS = 90;
 
+const EMPTY_PRESENCE: EngineerPresence = {
+  chatStatus: "OFFLINE",
+  activeChats: 0,
+  maxConcurrentChats: 1,
+  atCapacity: false,
+  cases: [],
+  pendingTimeoutSeconds: DEFAULT_PENDING_TIMEOUT_SECONDS,
+};
+
 /**
  * Reads the authenticated engineer's current live-chat-routing presence:
  * GET /engineers/me/status (see csm-portal/backend's internal/handler/
  * chat.go HandleGetPresence, which proxies the standalone chat-routing-
- * service's own default of OFFLINE for an engineer it has never seen a
- * presence update from).
+ * service's own default of OFFLINE/capacity 1/no cases for an engineer it
+ * has never seen a presence update from).
  *
  * This backend returns 502 whenever the standalone chat-routing-service
  * itself is unreachable (e.g. not started yet) — a real, expected-during-
  * development condition rather than a transient blip, so this query
- * swallows that failure and reports OFFLINE (the same default the routing
- * service itself would report for an unseen engineer) instead of
- * surfacing an error state. `retry: false` matters just as much as the
+ * swallows that failure and reports the same OFFLINE/empty default instead
+ * of surfacing an error state. `retry: false` matters just as much as the
  * catch here: without it, react-query's default exponential-backoff retry
  * re-hits a down dependency on every mount/refetch, which is what was
  * flooding the console with repeated 502s.
@@ -94,15 +127,17 @@ export function useGetEngineerStatus(): UseQueryResult<EngineerPresence, Error> 
     queryKey: ENGINEER_STATUS_QUERY_KEY,
     queryFn: async () => {
       try {
-        const result = await api.get<EngineerPresence>("/engineers/me/status");
+        const result = await api.get<Partial<EngineerPresence>>("/engineers/me/status");
         return {
-          status: result?.status ?? "OFFLINE",
-          currentCase: result?.currentCase,
-          pendingSince: result?.pendingSince,
+          chatStatus: result?.chatStatus ?? "OFFLINE",
+          activeChats: result?.activeChats ?? 0,
+          maxConcurrentChats: result?.maxConcurrentChats ?? 1,
+          atCapacity: result?.atCapacity ?? false,
+          cases: result?.cases ?? [],
           pendingTimeoutSeconds: result?.pendingTimeoutSeconds ?? DEFAULT_PENDING_TIMEOUT_SECONDS,
         };
       } catch {
-        return { status: "OFFLINE", pendingTimeoutSeconds: DEFAULT_PENDING_TIMEOUT_SECONDS };
+        return EMPTY_PRESENCE;
       }
     },
     retry: false,
@@ -119,16 +154,16 @@ export function useGetEngineerStatus(): UseQueryResult<EngineerPresence, Error> 
  *
  * Deliberately invalidates rather than optimistically setting the cache to
  * the requested status: going AVAILABLE with a non-empty queue immediately
- * reassigns the engineer to BUSY server-side (see router.Router.
- * SetPresence's queue-drain), so the requested status can be wrong the
- * instant this resolves. The actual delivery of a queue-drained case still
- * arrives independently over the SSE alert stream as a normal
- * "customer_escalation" event (see EngineerAlertNotification) — this hook
- * does not need to special-case it, just not lie about the status in the
- * meantime.
+ * claims cases off it up to this engineer's own capacity (see
+ * router.Router.SetPresence's queue-drain), so the requested status can be
+ * right but the case list wrong the instant this resolves. The actual
+ * delivery of each queue-drained case still arrives independently over the
+ * SSE alert stream as a normal "customer_escalation" event (see
+ * EngineerAlertNotification) — this hook does not need to special-case it,
+ * just not lie about the cached presence in the meantime.
  */
 export function useSetEngineerStatus(): UseMutationResult<
-  { applied: boolean; pendingOffline?: boolean },
+  { applied: boolean; assignedCases?: EngineerCaseInfo[] },
   Error,
   EngineerStatus
 > {
@@ -136,7 +171,7 @@ export function useSetEngineerStatus(): UseMutationResult<
   const queryClient = useQueryClient();
 
   return useMutation<
-    { applied: boolean; pendingOffline?: boolean },
+    { applied: boolean; assignedCases?: EngineerCaseInfo[] },
     Error,
     EngineerStatus
   >({

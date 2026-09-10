@@ -39,11 +39,12 @@ export interface DeclineChatSessionInput {
  * it if none are free; this call does not need to know which happened.
  *
  * Declining releases the SAME routing-service capacity accepting would
- * have (you're assigned, and therefore PENDING, the moment an escalation
- * routes to you — before you've clicked anything, see router.Router.
- * Accept for how PENDING later becomes BUSY) — so this also invalidates
- * the status dropdown's query the same way completing a session does,
- * rather than leaving it stuck showing PENDING.
+ * have (you hold this case, and it counts toward your concurrent-chat
+ * capacity, the moment an escalation routes to you — before you've clicked
+ * anything, see the 2026-09-10 concurrent-chat-capacity change) — so this
+ * also invalidates the status/case-list query the same way completing a
+ * session does, rather than leaving it stuck listing a case that's no
+ * longer yours.
  */
 export function useDeclineChatSession(): UseMutationResult<
   { message: string },

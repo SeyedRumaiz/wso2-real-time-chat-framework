@@ -6,13 +6,21 @@ live-chat escalation from the customer portal. It sits between
 every case/session HTTP route — and PostgreSQL, where engineer presence and
 the waiting queue are persisted.
 
-Escalations are routed to exactly one engineer — whoever's least busy
-today — instead of being broadcast to everyone. Anyone who arrives while
-all engineers are busy waits in a FIFO queue that drains automatically as
-engineers free up. An assigned engineer shows `PENDING` (capacity reserved,
-alert not yet acted on) until they explicitly call `POST /route/accept`,
-only then becoming `BUSY` — the CSM portal's status bar never shows Busy
-before the engineer has actually accepted the case.
+Escalations are routed to exactly one engineer — whoever has the most spare
+concurrent-chat capacity and is least busy today — instead of being
+broadcast to everyone. Anyone who arrives while every engineer is at
+capacity waits in a FIFO queue that drains automatically as engineers free
+up. Each engineer has a configurable concurrent-chat capacity
+(`max_concurrent_chats`, default 1, confirmed with the mentor 2026-09-10 —
+see the project's `db-schema-review-2026-09-07-outcomes.md`), so — unlike
+the original single-case version of this service — an engineer isn't
+blocked from picking up a second (or third, ...) chat while an earlier
+customer is slow to respond. A freshly-assigned case is *pending* until the
+engineer explicitly calls `POST /route/accept`; "pending" and "which cases
+an engineer currently holds" are per-case facts (see
+[Data model](#data-model)), not a top-level engineer status — an
+engineer's own `chat_status` (`AVAILABLE`/`BUSY`/`OFFLINE`) is now a plain
+manual toggle, independent of how many cases they're actually holding.
 
 Engineers are identified throughout this service by their IdP `userid`
 claim, not their email — this service stores no user profile data of its
@@ -105,74 +113,93 @@ next tier only when the previous one comes up empty:
 
 | Priority | Rule | Notes |
 |---|---|---|
-| 1 · Least busy | Whichever `AVAILABLE` engineer has **accepted the fewest chats today**. | Computed live with `COUNT(*)` over `chat_conversation` for rows where `assignee_id` matches and `updated_at` falls in `[CURRENT_DATE, CURRENT_DATE + 1)` — not a stored counter, so there's no lazy-reset bookkeeping to get wrong; an engineer with zero rows today is simply `0`. This counts chats **accepted** today, not merely assigned — an engineer who's repeatedly assigned-then-declines doesn't look busier than they really are. |
-| 2 · Tie-break | Among engineers tied on chats today, whoever has been `AVAILABLE` the **longest** (`available_since` ascending). | |
-| 3 · Queue | If no engineer is `AVAILABLE` at all, the case's `chat_queue` row stays `WAITING_FOR_ENGINEER` (FIFO by `created_at`). | Once an engineer frees up, they claim the oldest waiting row directly (see `SetPresence` / `Completed` below); least-busy ranking isn't re-applied to queued cases. |
+| 1 · Spare capacity | Whichever `AVAILABLE` engineer has the **fewest currently-active concurrent chats**, and has spare capacity at all (`active chats < max_concurrent_chats`). | "Active" means an `OPEN` or `ACTIVE` `chat_conversation` row assigned to them with `session_ended_at IS NULL` — see [Data model](#data-model). An engineer already at their own `max_concurrent_chats` is never selected, however idle they otherwise look. |
+| 2 · Least busy | Among engineers tied on active chats, whoever has **accepted the fewest chats today**. | Computed live with `COUNT(*)` over `chat_conversation` for rows where `assignee_id` matches and `updated_at` falls in `[CURRENT_DATE, CURRENT_DATE + 1)` — not a stored counter, so there's no lazy-reset bookkeeping to get wrong; an engineer with zero rows today is simply `0`. This counts chats **accepted** today, not merely assigned — an engineer who's repeatedly assigned-then-declines doesn't look busier than they really are. |
+| 3 · Tie-break | Among engineers still tied, whoever has been `AVAILABLE` the **longest** (`available_since` ascending). | |
+| 4 · Queue | If no engineer is `AVAILABLE` with spare capacity, the case's `chat_queue` row stays `WAITING_FOR_ENGINEER` (FIFO by `created_at`). | Once an engineer frees up a slot, they claim the oldest waiting row directly (see `SetPresence` / `Completed` below); least-busy ranking isn't re-applied to queued cases. |
 
 There is no per-customer stickiness — every escalation is routed purely by
 current availability and load, never by who handled that customer last.
 
 ## Presence state machine
 
-`PENDING` and `BUSY` are never a direct `SetPresence` request — only
-`AVAILABLE`/`OFFLINE` are. Both count as "has a current case" for every
-check below (mid-session handling, `Decline`'s own-case check); the only
-thing that separates them is `Router.Accept`.
+Since the 2026-09-10 concurrent-chat-capacity change, `chat_status`
+(`AVAILABLE`/`BUSY`/`OFFLINE`) is a **plain manual toggle**, all three
+values directly requestable via `SetPresence`, and completely decoupled
+from how many cases an engineer is actually holding. `BUSY` is a real
+do-not-disturb — an engineer sets it themselves to stop taking new work
+without dropping any case they already hold; it is never set automatically
+by an assignment the way it used to be in the original single-case version
+of this service.
 
-**Internal representation note:** `cs_engineer_status.chat_status` itself
-only ever stores `AVAILABLE`, `BUSY`, or `OFFLINE` — `PENDING` is not a
-storable enum value. Whether a `BUSY` engineer is actually still `PENDING`
-is derived from a nullable `accepted_at` timestamp (`NULL` = reserved but
-not yet accepted, set = accepted) via `isPendingAccept`/`externalStatus` in
-`state.go`. This is purely an internal storage detail — every HTTP response
-below still reports `PENDING` exactly as if it were a stored value.
+"Pending" (assigned, not yet accepted) and "which cases an engineer
+currently holds" are **per-case facts**, derived from `chat_conversation`
+(`assignee_id`, `state`, `accepted_at`, `session_ended_at`), not top-level
+engineer state — see [Data model](#data-model). This is what makes holding
+several cases at once representable at all: a single "current case" column
+on the engineer's own row could never express that.
 
 | From | Request | Result |
 |---|---|---|
-| any, idle | `AVAILABLE` | joins the pool (`available_since` set); if the queue has a `WAITING_FOR_ENGINEER` row, immediately claims the oldest one and assigns it (engineer becomes `PENDING`, not `BUSY` — see `Accept` below) |
-| any, idle | `OFFLINE` | out of the pool |
-| mid-session (`PENDING` or `BUSY`, `current_case` set) | `OFFLINE` requested | takes effect **immediately** — `chat_status` flips to `OFFLINE` right away, but `current_case`/`accepted_at` are left untouched until the session is actually resolved via `Accept`, `Decline`, `Completed`, or a timeout |
-| mid-session | `AVAILABLE` or `BUSY` requested | undoes an earlier mid-session `OFFLINE` request by flipping `chat_status` back to `BUSY` (no-op if they weren't `OFFLINE`); the session itself is untouched either way (one dedicated session, can't free early) |
-| `PENDING` on `caseId` | `POST /route/accept {userId, caseId}` | sets `accepted_at = now()` without forcing `chat_status` back to `BUSY` (so an engineer who went `OFFLINE` mid-session can still accept), **deletes the case's `chat_queue` row**, and a `CONNECTED` row is recorded in `chat_queue_engineer_assignment`. A stale accept (already declined/reassigned/accepted, or a different `caseId`) reports `{applied:false}` rather than erroring. |
-| `PENDING` on `caseId`, too long | (no explicit request — a periodic `POST /route/sweep-timeouts` call finds it) | the engineer is left/taken `OFFLINE` (not re-queued as available — they didn't respond, so immediately handing them another case would likely repeat the timeout) and the case is reassigned to the next available engineer, or its `chat_queue` row flips back to `WAITING_FOR_ENGINEER` if nobody's free — same outcome shape as a `Decline`, just triggered by elapsed time instead of the engineer's own click; either way a `TIMED_OUT` row is recorded in `chat_queue_engineer_assignment`. This sweep also catches an engineer who went `OFFLINE` mid-session before ever confirming the case, not just one still sitting `BUSY`. |
+| any | `AVAILABLE` | joins (or rejoins) the pool (`available_since` set); then claims cases off the `WAITING_FOR_ENGINEER` queue, oldest first, until either it's empty or this engineer's `max_concurrent_chats` is reached — so more than one case can be delivered from a single presence change (see `PresenceResult.assignedCases`) |
+| any | `BUSY` | leaves the pool (no new assignments) but takes no action on any case already held — a pure do-not-disturb toggle |
+| any | `OFFLINE` | leaves the pool; also takes no action on any case already held — an engineer can be `OFFLINE` while still mid-conversation on cases assigned before they went offline |
+| holding a pending case on `caseId` | `POST /route/accept {userId, caseId}` | sets that one conversation's `state = 'ACTIVE'`, `accepted_at = now()`, **deletes the case's `chat_queue` row**, and records a `CONNECTED` row in `chat_queue_engineer_assignment`. Only this case is affected — any other concurrent case this engineer holds is untouched. A stale accept (already declined/reassigned/accepted, or a different `caseId`) reports `{applied:false}` rather than erroring. |
+| holding a pending case on `caseId`, too long | (no explicit request — a periodic `POST /route/sweep-timeouts` call finds it) | that one case is reassigned to the next engineer with spare capacity, or its `chat_queue` row flips back to `WAITING_FOR_ENGINEER` if nobody qualifies — same outcome shape as a `Decline`, just triggered by elapsed time instead of the engineer's own click; either way a `TIMED_OUT` row is recorded in `chat_queue_engineer_assignment`. **Unlike the original single-case version of this service, the unresponsive engineer's `chat_status` is left completely untouched** — they may well be mid-conversation on a different concurrent case at the same time, and a timeout on one case is no longer a reason to pull them off everything else. |
 
-**On session completion:** if the engineer is `OFFLINE` (having requested it
-mid-session, or otherwise), they go straight to fully idle and do **not**
-rejoin the pool or take a queued case. Otherwise, the engineer becomes
-`AVAILABLE`, rejoins the pool, and the router immediately tries to claim the
-queue's oldest waiting row (again as `PENDING`).
+**On session completion (`POST /route/completed {userId, caseId}`):** that
+one conversation's `session_ended_at` is set. If the engineer is still
+`chat_status = AVAILABLE` and now has spare capacity, the router claims one
+queued case for them the same way `SetPresence`'s own drain does — but at
+most one, since only one slot was just freed (`CompletedResult.
+assignedCase`, singular). `chat_status` itself is never touched by this
+call.
 
 **On decline** (dismissing an alert before accepting): a `REJECTED` row is
-recorded in `chat_queue_engineer_assignment`, the declining engineer is
-freed exactly like a completion, then the case is either handed to the
-next-best available engineer by the same least-busy/tie-break ranking
-(excluding the decliner, and again assigned as `PENDING` — the
-`chat_queue` row stays `ASSIGNED`, just to someone else), or its
-`chat_queue` row flips back to `WAITING_FOR_ENGINEER`. Because that row is
-never deleted and re-inserted — only ever updated in place, from `Escalate`
-until `Accept` — it keeps its **original** `created_at`, which is what puts
-it ahead of every case that arrived after it without any separate
-"front of queue" flag.
+recorded in `chat_queue_engineer_assignment`, that one conversation's
+`assignee_id`/`accepted_at` are cleared, then the case is either handed to
+the next engineer with spare capacity by the same ranking `Escalate` uses
+(excluding the decliner — see [Assignment priority](#assignment-priority)),
+or its `chat_queue` row flips back to `WAITING_FOR_ENGINEER`. Because that
+row is never deleted and re-inserted — only ever updated in place, from
+`Escalate` until `Accept` — it keeps its **original** `created_at`, which is
+what puts it ahead of every case that arrived after it without any separate
+"front of queue" flag. Declining doesn't affect any of the decliner's other
+concurrent cases.
 
 ## Data model
 
-Three tables, in their own `chat_routing` schema, separate from
-`entity-service`'s flat `cases` table:
+In their own `chat_routing` schema, separate from `entity-service`'s flat
+`cases` table:
 
 | Table | Holds | Ordering / lookup |
 |---|---|---|
-| `cs_engineer_status` | `user_id` (PK, the IdP's `userid` claim), `chat_status` (`AVAILABLE`/`BUSY`/`OFFLINE` only — `PENDING` is derived, see [Presence state machine](#presence-state-machine)), `current_case_id` / `current_case` (JSONB), `accepted_at`, `available_since` | `available_since` — oldest-idle-first (tier-2 tie-break) |
+| `cs_engineer_status` | `user_id` (PK, the IdP's `userid` claim), `chat_status` (`AVAILABLE`/`BUSY`/`OFFLINE` — a plain manual toggle, see [Presence state machine](#presence-state-machine)), `max_concurrent_chats` (configurable capacity, default `1`, `CHECK` between 1 and 20), `available_since` | `available_since` — oldest-idle-first (assignment-priority tier-3 tie-break) |
+| `chat_conversation` | the LOCAL STAND-IN work-item pairing (see [Integrating from another service](#integrating-from-another-service)) — this is now also the **source of truth for which cases an engineer holds**: `case_id`, `assignee_id` (set at assignment time, not just at Accept), `state` (`OPEN` until `Accept` moves it to `ACTIVE`), `accepted_at`, `session_ended_at`, `case_info` (JSONB) | indexed on `(assignee_id, state)` where `assignee_id IS NOT NULL AND session_ended_at IS NULL` — the "active chats" set every capacity check and the timeout sweep scan |
 | `chat_queue_engineer_assignment` | one append-only row per assignment **outcome**: `conversation_id`, `engineer_id`, `status` (`CONNECTED`/`REJECTED`/`TIMED_OUT`), `occurred_at` | indexed on `(conversation_id, occurred_at)` and `(engineer_id, occurred_at)`; a pure audit trail of accept/decline/timeout outcomes — it isn't written at assignment time, so it can't answer "how many chats was this engineer assigned today" (see [Assignment priority](#assignment-priority)) |
 | `chat_queue` | one row **per active (unaccepted) escalation**, from `Escalate` until `Accept` — `chat_conversation_id` (PK), `case_info` (JSONB), `status` (`WAITING_FOR_ENGINEER`/`ASSIGNED`) | `(created_at, chat_conversation_id)` ascending among `WAITING_FOR_ENGINEER` rows — a fresh case sorts by arrival time, and a reassigned/requeued row keeps its *original* `created_at` (see [Presence state machine](#presence-state-machine)) since it's only ever updated in place, never deleted and re-inserted |
 
-`case_info` / `current_case` are stored as JSONB blobs (`router.CaseInfo` —
-`caseId`, `conversationId`, `projectId`, `subject`, `customerEmail`,
-`customerName`, `message`) rather than normalized columns, kept for two
-reasons: this service never queries *into* that blob by any field other
-than `caseId` (`current_case`) or `conversationId` (`case_info`, keyed by
-`chat_conversation_id`); and `entity-service`'s real case data lives in a
-separate service, with even this feature's own temporary `work_item`/
-`chat_conversation` stand-in tables (see
+**An engineer no longer has a single `current_case` column** — as of the
+2026-09-10 concurrent-chat-capacity change, `cs_engineer_status.
+current_case_id`/`current_case`/`accepted_at` were dropped entirely; "which
+cases is this engineer holding right now" is answered by querying
+`chat_conversation` for rows with `assignee_id = <them>`, `state IN
+('OPEN','ACTIVE')`, `session_ended_at IS NULL`, not by a column on the
+engineer's own row. This is also why `chat_conversation.case_info` exists:
+`assignee_id` is now set at *assignment* time (not only at `Accept`), so
+`chat_queue`'s own `case_info` copy — which is deleted the moment `Accept`
+removes that row — is no longer enough on its own to keep showing a
+case's subject/message/customer name for the rest of an already-accepted
+session; `chat_conversation.case_info` is populated once at `CreateWorkItem`
+time and outlives `Accept`.
+
+`case_info` is stored as a JSONB blob (`router.CaseInfo` — `caseId`,
+`conversationId`, `projectId`, `subject`, `customerEmail`, `customerName`,
+`message`) rather than normalized columns, kept for two reasons: this
+service never queries *into* that blob by any field other than `caseId`;
+and `entity-service`'s real case data lives in a separate service, with
+even this feature's own temporary `work_item`/`chat_conversation` stand-in
+tables (see
 [Integrating from another service](#integrating-from-another-service))
 not populated until *after* `Router.Escalate` returns — so a queued or
 freshly-drained customer would otherwise lose their subject/message/
@@ -204,13 +231,13 @@ All routes below `/route/*` require the `X-Routing-Service-Token` header
 | Method | Path | Body / params | Response |
 |---|---|---|---|
 | `POST` | `/route/escalate` | `CaseInfo` fields | `{engineerId}` or `{queued:true, position:N}` |
-| `POST` | `/route/presence` | `{userId, status}` | `{applied, assignedCase?}` |
-| `POST` | `/route/completed` | `{userId}` | `{removed, rejoined, assignedCase?}` |
-| `POST` | `/route/decline` | `{userId, caseId}` | `{reassignedTo?, requeued?}` |
-| `POST` | `/route/accept` | `{userId, caseId}` | `{applied}` — `PENDING` → `BUSY`; `false` if stale (see [Presence state machine](#presence-state-machine)) |
-| `GET` | `/route/presence/{userId}` | — | `{status, currentCase?, pendingSince?, pendingTimeoutSeconds}` (defaults to `OFFLINE`, no case, for an unseen engineer; `currentCase`/`pendingSince` set when `PENDING`; `currentCase` also set when `BUSY`; `pendingTimeoutSeconds` always present) |
-| `GET` | `/route/debug/state` | — | full dump of `cs_engineer_status` (incl. today's chat count) + `chat_queue`'s waiting rows — verification only |
-| `POST` | `/route/sweep-timeouts` | — | reassigns/requeues any case whose engineer has been `PENDING` past `PENDING_TIMEOUT_SECONDS`, taking them `OFFLINE` — `{results: [...]}`, polled periodically by `csm-portal/backend` (see [Presence state machine](#presence-state-machine)) |
+| `POST` | `/route/presence` | `{userId, status}` — `status` is `AVAILABLE`/`BUSY`/`OFFLINE`, all directly requestable | `{applied, assignedCases?}` — going `AVAILABLE` can drain more than one queued case at once (see [Presence state machine](#presence-state-machine)), so `assignedCases` is a list |
+| `POST` | `/route/completed` | `{userId, caseId}` | `{ended, assignedCase?}` — ends this one conversation; `assignedCase` (singular) is set if that freed slot was immediately backfilled |
+| `POST` | `/route/decline` | `{userId, caseId}` | `{reassignedTo?, requeued?, assignedCase?}` |
+| `POST` | `/route/accept` | `{userId, caseId}` | `{applied}` — moves this one conversation `OPEN` → `ACTIVE`; `false` if stale (see [Presence state machine](#presence-state-machine)) |
+| `GET` | `/route/presence/{userId}` | — | `{chatStatus, activeChats, maxConcurrentChats, atCapacity, cases: [{...CaseInfo, pending, assignedAt}], pendingTimeoutSeconds}` — `cases` lists every case this engineer currently holds, pending or accepted alike (defaults to `OFFLINE`/capacity 1/no cases for an unseen engineer) |
+| `GET` | `/route/debug/state` | — | full dump of `cs_engineer_status` (capacity, active/today counts) + `chat_queue`'s waiting rows — verification only |
+| `POST` | `/route/sweep-timeouts` | — | reassigns/requeues any case whose engineer has been pending past `PENDING_TIMEOUT_SECONDS` — `{results: [...]}`, polled periodically by `csm-portal/backend`. Only the timed-out case is affected; the engineer's `chat_status` and any other concurrent case they hold are left untouched (see [Presence state machine](#presence-state-machine)) |
 | `GET` | `/health` | — | `200 OK` |
 
 `userId` is the IdP's stable per-account `userid` claim, everywhere it
@@ -254,7 +281,7 @@ Loaded from the environment (a `.env` file is read first if present — see
 |---|---|
 | `ROUTING_SERVICE_PORT` | bare port number, default `9096` |
 | `ROUTING_SERVICE_TOKEN` | shared secret; must match `csm-portal/backend`'s value |
-| `PENDING_TIMEOUT_SECONDS` | how long (seconds) an engineer can sit `PENDING` before `POST /route/sweep-timeouts` reassigns/requeues their case and takes them `OFFLINE`; default `90` |
+| `PENDING_TIMEOUT_SECONDS` | how long (seconds) a case can sit assigned-but-unconfirmed before `POST /route/sweep-timeouts` reassigns/requeues it — only that one case is affected, not the engineer's `chat_status` or any other concurrent case they hold; default `90` |
 | `DB_HOST`, `DB_PORT`, `DB_NAME` | **point these at the same database `entity-service` uses** — this service's tables live in their own Postgres schema (see [Data model](#data-model)), not a separate database, so there's nothing dedicated to stand up here |
 | `DB_USER`, `DB_PASSWORD` | credentials for that database — reusing `entity-service`'s own user is fine for local dev; a narrower-scoped role needs the grants noted in [Running locally](#running-locally) |
 | `DB_SSLMODE` | default `disable` (local dev) |

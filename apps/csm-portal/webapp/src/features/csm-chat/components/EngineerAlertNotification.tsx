@@ -42,7 +42,23 @@ import {
 } from "@features/csm-chat/api/useEngineerStatus";
 import type { ChatAlertEvent } from "@features/csm-chat/types/chatAlerts";
 
+type LiveChatMessage = {
+  id: string;
+  from: "customer" | "engineer";
+  text: string;
+};
+
+// A pending alert (assigned, not yet accepted) or an already-accepted
+// active session, keyed by caseId in casesByCaseId below -- an engineer
+// can hold several of either kind at once now (see the 2026-09-10
+// concurrent-chat-capacity change), so this widget renders a stack of
+// cards rather than at most one of each. A single discriminated union
+// keyed by caseId (rather than two separate maps) means a given case is
+// never simultaneously "pending" in one map and "active" in another after
+// an Accept -- there is exactly one entry per case, and accepting it just
+// replaces its kind in place.
 type PendingAlert = {
+  kind: "pending";
   caseId: string;
   conversationId: string;
   projectId?: string;
@@ -52,23 +68,20 @@ type PendingAlert = {
   message?: string;
   // ISO 8601 -- when this engineer was assigned this case (from the SSE
   // event's own timestamp for a fresh assignment, or from GetPresence's
-  // pendingSince when rehydrating after a refresh). Drives the accept-
-  // countdown below.
+  // per-case assignedAt when rehydrating after a refresh). Drives the
+  // accept-countdown below.
   assignedAt: string;
 };
 
-type LiveChatMessage = {
-  id: string;
-  from: "customer" | "engineer";
-  text: string;
-};
-
 type ActiveSession = {
+  kind: "session";
   caseId: string;
   conversationId: string;
   customerName?: string;
   messages: LiveChatMessage[];
 };
+
+type CaseEntry = PendingAlert | ActiveSession;
 
 /**
  * App-wide floating widget for the live-engineer-chat escalation feature —
@@ -77,23 +90,17 @@ type ActiveSession = {
  * visible on every page for any signed-in engineer, independent of which
  * route they're on.
  *
- * Holds exactly one pending alert and one active session at a time — a
- * deliberate simplification matching this feature's other accepted
- * shortcuts (see the backend doc comment: no queue, no claim/lock table).
- * Any escalation beyond the one currently shown is silently ignored by
- * handleAlert until the current one clears; at this project's current
- * scale (a handful of engineers) that is an acceptable limitation, not a
- * bug — a fuller "chat inbox" is a natural follow-up if this ever matters.
- *
- * Renders nothing (returns null) whenever there is neither a pending alert
- * nor an active session, so it never occupies space or blocks a click when
- * idle.
+ * Renders a stack of cards -- one per case this engineer currently holds,
+ * pending or accepted alike (see casesByCaseId) -- now that an engineer's
+ * concurrent-chat capacity can be more than one (see the 2026-09-10
+ * concurrent-chat-capacity change). Renders nothing (returns null) whenever
+ * there are no cases at all, so it never occupies space or blocks a click
+ * when idle.
  */
 export default function EngineerAlertNotification(): JSX.Element | null {
   const myEmail = useIdTokenClaims()?.email;
-  const [pending, setPending] = useState<PendingAlert | null>(null);
-  const [session, setSession] = useState<ActiveSession | null>(null);
-  const [messageDraft, setMessageDraft] = useState("");
+  const [casesByCaseId, setCasesByCaseId] = useState<Record<string, CaseEntry>>({});
+  const [draftByCaseId, setDraftByCaseId] = useState<Record<string, string>>({});
 
   const acceptMutation = useAcceptChatSession();
   const sendMutation = useSendChatMessage();
@@ -102,122 +109,122 @@ export default function EngineerAlertNotification(): JSX.Element | null {
   const queryClient = useQueryClient();
   const { data: presence } = useGetEngineerStatus();
 
-  // Ticks once a second, only while a pending alert is showing, to drive
-  // the accept-countdown rendered below -- see PendingAlert.assignedAt and
-  // presence.pendingTimeoutSeconds (chat-routing-service's configured
-  // PENDING_TIMEOUT_SECONDS). Purely a UI countdown: the real timeout is
-  // enforced server-side on its own poll cadence (see that service's
-  // SweepExpiredPending and csm-portal/backend's StartTimeoutSweeper), so
-  // this can briefly read a few seconds past zero before the case_timed_
-  // out/session_accepted event for it actually arrives and clears it.
+  const entries = Object.values(casesByCaseId);
+  const pendingEntries = entries.filter((e): e is PendingAlert => e.kind === "pending");
+  const sessionEntries = entries.filter((e): e is ActiveSession => e.kind === "session");
+
+  // Ticks once a second, only while at least one pending alert is showing,
+  // to drive each card's accept-countdown below -- see PendingAlert.
+  // assignedAt and presence.pendingTimeoutSeconds (chat-routing-service's
+  // configured PENDING_TIMEOUT_SECONDS). Purely a UI countdown: the real
+  // timeout is enforced server-side on its own poll cadence (see that
+  // service's SweepExpiredPending and csm-portal/backend's
+  // StartTimeoutSweeper), so this can briefly read a few seconds past zero
+  // before the case_timed_out/session_accepted event for it actually
+  // arrives and clears it.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!pending) return;
+    if (pendingEntries.length === 0) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [pending]);
+  }, [pendingEntries.length]);
 
   const pendingTimeoutSeconds = presence?.pendingTimeoutSeconds ?? DEFAULT_PENDING_TIMEOUT_SECONDS;
-  const remainingSeconds = pending
-    ? Math.max(
-        0,
-        pendingTimeoutSeconds - Math.floor((now - new Date(pending.assignedAt).getTime()) / 1000),
-      )
-    : null;
+  const remainingSecondsFor = useCallback(
+    (assignedAt: string): number =>
+      Math.max(0, pendingTimeoutSeconds - Math.floor((now - new Date(assignedAt).getTime()) / 1000)),
+    [now, pendingTimeoutSeconds],
+  );
 
-  // Clears currentCase in the cached presence the instant a session/alert
-  // is locally dismissed (handleComplete/handleDismiss), rather than
+  // Removes one case from the cached presence's `cases` array the instant
+  // it's locally dismissed (handleComplete/handleDismiss), rather than
   // waiting for the mutation's own invalidateQueries to trigger a refetch.
   // Without this, there's a window — between clearing local state here and
-  // that refetch actually resolving — where this query's cached data is
-  // still the OLD value (status BUSY/PENDING, currentCase set), and the
-  // rehydrate effect right below fires on exactly that stale read (its
-  // deps include `presence`, and pending/session just became null),
-  // resurrecting the very session/alert that was just dismissed. That was
-  // the "End Session button comes back, and clicking it again drops you to
-  // Available instead of Offline" bug: the resurrected widget let
-  // handleComplete fire a *second* POST .../complete for the same
-  // already-ended case, and chat-routing-service's Completed() -- now
-  // guarded against this specifically, see its own doc comment -- used to
-  // silently re-derive AVAILABLE/OFFLINE from pending_offline's value
-  // *after* the first call had already reset it. This fixes the cause on
-  // the UI side; the router-level guard fixes it defensively either way.
-  const clearCachedCurrentCase = useCallback((): void => {
-    queryClient.setQueryData<EngineerPresence | undefined>(
-      ENGINEER_STATUS_QUERY_KEY,
-      (prev) => (prev ? { ...prev, currentCase: undefined } : prev),
-    );
-  }, [queryClient]);
+  // that refetch actually resolving — where this query's cached data still
+  // lists the OLD case, and the rehydrate effect right below fires on
+  // exactly that stale read, resurrecting the very card that was just
+  // dismissed. See this file's git history for the "End Session button
+  // comes back" bug this originally fixed, back when there was only ever
+  // one case to track.
+  const clearCachedCase = useCallback(
+    (caseId: string): void => {
+      queryClient.setQueryData<EngineerPresence | undefined>(ENGINEER_STATUS_QUERY_KEY, (prev) =>
+        prev ? { ...prev, cases: prev.cases.filter((c) => c.caseId !== caseId) } : prev,
+      );
+    },
+    [queryClient],
+  );
 
-  // Rehydrates a lost alert/session after a refresh or a remount of this
+  // Rehydrates every case lost after a refresh or a remount of this
   // component (it's mounted once in AuthGuard, but a full page reload
-  // still wipes pending/session, which live only in this component's own
-  // state — see the doc comment on this whole component). GetPresence's
-  // status now distinguishes PENDING (assigned, not yet accepted) from
-  // BUSY (already accepted, chat in progress) — see chat-routing-service's
-  // router.Router.Accept — so this rehydrates straight into the matching
-  // local state instead of always guessing "pending" the way it had to
-  // before that distinction existed: PENDING becomes a pending alert
-  // (Accept/Decline still to come), BUSY goes directly into an active
-  // session with an empty message history (any messages exchanged before
-  // the reload are still in the case's comment history server-side, just
-  // not replayed into this local transcript). Either way, this is what
-  // gets an engineer un-stuck who is genuinely still PENDING/BUSY
-  // server-side with nothing left in the UI to act on.
+  // still wipes casesByCaseId, which lives only in this component's own
+  // state — see the doc comment on this whole component). Adds one entry
+  // per case in presence.cases that isn't already tracked locally --
+  // pending cases (assigned, not yet accepted) become pending alerts,
+  // already-accepted cases go straight into an active session with an
+  // empty message history (any messages exchanged before the reload are
+  // still in the case's comment history server-side, just not replayed
+  // into this local transcript). This is what gets an engineer un-stuck
+  // who is genuinely still holding one or more cases server-side with
+  // nothing left in the UI to act on.
   useEffect(() => {
-    if (pending || session || !presence?.currentCase) return;
-    const cc = presence.currentCase;
-    if (presence.status === "BUSY") {
-      setSession({
-        caseId: cc.caseId,
-        conversationId: cc.conversationId,
-        customerName: cc.customerName,
-        messages: [],
-      });
-      return;
-    }
-    setPending({
-      caseId: cc.caseId,
-      conversationId: cc.conversationId,
-      subject: cc.subject,
-      customerEmail: cc.customerEmail,
-      customerName: cc.customerName,
-      message: cc.message,
-      // Falls back to "now" only if the backend somehow omitted
-      // pendingSince for a PENDING engineer, which SweepExpiredPending's
-      // own status check should make impossible -- this just avoids a
-      // broken/NaN countdown rather than silently trusting bad data.
-      assignedAt: presence.pendingSince ?? new Date().toISOString(),
+    if (!presence?.cases?.length) return;
+    setCasesByCaseId((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const c of presence.cases) {
+        if (prev[c.caseId]) continue;
+        changed = true;
+        next[c.caseId] = c.pending
+          ? {
+              kind: "pending",
+              caseId: c.caseId,
+              conversationId: c.conversationId,
+              subject: c.subject,
+              customerEmail: c.customerEmail,
+              customerName: c.customerName,
+              message: c.message,
+              assignedAt: c.assignedAt,
+            }
+          : {
+              kind: "session",
+              caseId: c.caseId,
+              conversationId: c.conversationId,
+              customerName: c.customerName,
+              messages: [],
+            };
+      }
+      return changed ? next : prev;
     });
-  }, [pending, session, presence]);
+  }, [presence]);
 
   const handleAlert = useCallback(
     (event: ChatAlertEvent) => {
       switch (event.type) {
         case "customer_escalation": {
           if (!event.caseId || !event.conversationId) return;
-          // Ignore new escalations while already showing one, or while a
-          // session is live — see this component's own doc comment.
-          if (session) return;
           // Receiving this event at all means the routing service just
-          // assigned this case to us — we're PENDING server-side from this
-          // instant, before Accept is even clicked (see router.Router.
-          // Accept, which is what later flips this to BUSY). The status
-          // dropdown's query has no way to know that on its own (nothing
-          // pushes to it), so invalidate it here rather than leaving it
-          // stuck showing whatever it was cached as (usually Available).
+          // assigned this case to us — we hold it server-side from this
+          // instant, before Accept is even clicked. The capacity/case-list
+          // query has no way to know that on its own (nothing pushes to
+          // it), so invalidate it here rather than leaving it stuck
+          // showing a stale load count.
           queryClient.invalidateQueries({ queryKey: ENGINEER_STATUS_QUERY_KEY });
-          setPending((current) => {
-            if (current) return current;
+          setCasesByCaseId((current) => {
+            if (current[event.caseId as string]) return current;
             return {
-              caseId: event.caseId as string,
-              conversationId: event.conversationId as string,
-              projectId: event.projectId,
-              subject: event.subject,
-              customerEmail: event.customerEmail,
-              customerName: event.customerName,
-              message: event.message,
-              assignedAt: event.timestamp,
+              ...current,
+              [event.caseId as string]: {
+                kind: "pending",
+                caseId: event.caseId as string,
+                conversationId: event.conversationId as string,
+                projectId: event.projectId,
+                subject: event.subject,
+                customerEmail: event.customerEmail,
+                customerName: event.customerName,
+                message: event.message,
+                assignedAt: event.timestamp,
+              },
             };
           });
           break;
@@ -227,49 +234,62 @@ export default function EngineerAlertNotification(): JSX.Element | null {
           // transitions us to the active session locally (see
           // handleAccept), so only clear when a *different* engineer's
           // email comes back.
-          setPending((current) =>
-            current &&
-            current.caseId === event.caseId &&
-            event.engineerEmail !== myEmail
-              ? null
-              : current,
-          );
+          if (!event.caseId || event.engineerEmail === myEmail) break;
+          setCasesByCaseId((current) => {
+            const entry = current[event.caseId as string];
+            if (!entry || entry.kind !== "pending") return current;
+            const next = { ...current };
+            delete next[event.caseId as string];
+            return next;
+          });
           break;
         }
         case "customer_message": {
-          setSession((current) => {
-            if (!current || current.caseId !== event.caseId) return current;
+          if (!event.caseId) return;
+          setCasesByCaseId((current) => {
+            const entry = current[event.caseId as string];
+            if (!entry || entry.kind !== "session") return current;
             return {
               ...current,
-              messages: [
-                ...current.messages,
-                {
-                  id: `customer-${event.timestamp}-${current.messages.length}`,
-                  from: "customer",
-                  text: event.message ?? "",
-                },
-              ],
+              [event.caseId as string]: {
+                ...entry,
+                messages: [
+                  ...entry.messages,
+                  {
+                    id: `customer-${event.timestamp}-${entry.messages.length}`,
+                    from: "customer",
+                    text: event.message ?? "",
+                  },
+                ],
+              },
             };
           });
           break;
         }
         case "session_closed": {
-          setSession((current) =>
-            current && current.caseId === event.caseId ? null : current,
-          );
-          setPending((current) =>
-            current && current.caseId === event.caseId ? null : current,
-          );
+          if (!event.caseId) return;
+          setCasesByCaseId((current) => {
+            if (!current[event.caseId as string]) return current;
+            const next = { ...current };
+            delete next[event.caseId as string];
+            return next;
+          });
           break;
         }
         case "case_timed_out": {
           // We never accepted this one in time -- chat-routing-service
-          // already reassigned/requeued it and took us OFFLINE server-side
-          // (see that service's SweepExpiredPending). Only ever applies to
-          // a still-pending alert, never an active session.
-          setPending((current) =>
-            current && current.caseId === event.caseId ? null : current,
-          );
+          // already reassigned/requeued it (see that service's
+          // SweepExpiredPending). Only ever applies to a still-pending
+          // alert, never an active session; any other concurrent case we
+          // hold is unaffected, so this only ever removes this one entry.
+          if (!event.caseId) return;
+          setCasesByCaseId((current) => {
+            const entry = current[event.caseId as string];
+            if (!entry || entry.kind !== "pending") return current;
+            const next = { ...current };
+            delete next[event.caseId as string];
+            return next;
+          });
           queryClient.invalidateQueries({ queryKey: ENGINEER_STATUS_QUERY_KEY });
           break;
         }
@@ -277,7 +297,7 @@ export default function EngineerAlertNotification(): JSX.Element | null {
           break;
       }
     },
-    [session, myEmail],
+    [myEmail, queryClient],
   );
 
   // Always subscribed (enabled: true) for any signed-in engineer — there is
@@ -286,27 +306,36 @@ export default function EngineerAlertNotification(): JSX.Element | null {
   // configured — see useChatAlertsStream's own doc comment.
   useChatAlertsStream(true, handleAlert);
 
-  const handleAccept = useCallback(async (): Promise<void> => {
-    if (!pending) return;
-    const { caseId, conversationId, customerName } = pending;
-    try {
-      await acceptMutation.mutateAsync({ caseId, conversationId });
-      setSession({ caseId, conversationId, customerName, messages: [] });
-      setPending(null);
-    } catch (err) {
-      // A 409 means the routing service's Accept check found this case
-      // isn't PENDING-for-this-engineer anymore (see HandleAcceptSession) —
-      // it was declined, reassigned, or already accepted elsewhere while
-      // this alert sat on screen. Nothing to retry there, so clear it
-      // rather than leaving a stuck "Accept" button that will only ever
-      // fail again. Any other failure (network blip, routing service
-      // briefly down) leaves the alert visible so the engineer can retry,
-      // or another engineer's session_accepted clears it above.
-      if (err instanceof BackendApiError && err.status === 409) {
-        setPending(null);
+  const handleAccept = useCallback(
+    async (alert: PendingAlert): Promise<void> => {
+      const { caseId, conversationId, customerName } = alert;
+      try {
+        await acceptMutation.mutateAsync({ caseId, conversationId });
+        setCasesByCaseId((current) => ({
+          ...current,
+          [caseId]: { kind: "session", caseId, conversationId, customerName, messages: [] },
+        }));
+      } catch (err) {
+        // A 409 means the routing service's Accept check found this case
+        // isn't pending-for-this-engineer anymore (see HandleAcceptSession)
+        // — it was declined, reassigned, or already accepted elsewhere
+        // while this alert sat on screen. Nothing to retry there, so clear
+        // it rather than leaving a stuck "Accept" button that will only
+        // ever fail again. Any other failure (network blip, routing
+        // service briefly down) leaves the alert visible so the engineer
+        // can retry, or another engineer's session_accepted clears it
+        // above.
+        if (err instanceof BackendApiError && err.status === 409) {
+          setCasesByCaseId((current) => {
+            const next = { ...current };
+            delete next[caseId];
+            return next;
+          });
+        }
       }
-    }
-  }, [pending, acceptMutation]);
+    },
+    [acceptMutation],
+  );
 
   // Unlike handleComplete (clears immediately, decline is best-effort after),
   // this awaits the decline call BEFORE clearing: escalations are now routed
@@ -315,171 +344,185 @@ export default function EngineerAlertNotification(): JSX.Element | null {
   // seeing their request (see useDeclineChatSession's own doc comment). The
   // widget still clears locally even if the call fails — no worse than
   // today's un-routed dismiss.
-  const handleDismiss = useCallback(async (): Promise<void> => {
-    const current = pending;
-    if (current) {
+  const handleDismiss = useCallback(
+    async (alert: PendingAlert): Promise<void> => {
       try {
         await declineMutation.mutateAsync({
-          caseId: current.caseId,
-          conversationId: current.conversationId,
+          caseId: alert.caseId,
+          conversationId: alert.conversationId,
         });
       } catch {
         // Best-effort — still clear locally below either way.
       }
-    }
-    setPending(null);
-    clearCachedCurrentCase();
-  }, [pending, declineMutation, clearCachedCurrentCase]);
+      setCasesByCaseId((current) => {
+        const next = { ...current };
+        delete next[alert.caseId];
+        return next;
+      });
+      clearCachedCase(alert.caseId);
+    },
+    [declineMutation, clearCachedCase],
+  );
 
-  const handleSend = useCallback(async (): Promise<void> => {
-    const text = messageDraft.trim();
-    if (!text || !session) return;
-    setMessageDraft("");
-    const { caseId, conversationId } = session;
-    setSession((current) =>
-      current
-        ? {
-            ...current,
-            messages: [
-              ...current.messages,
-              { id: `engineer-${Date.now()}`, from: "engineer", text },
-            ],
-          }
-        : current,
-    );
-    try {
-      await sendMutation.mutateAsync({ caseId, conversationId, message: text });
-    } catch {
-      // Best-effort optimistic send — a failure just means the customer
-      // never saw this one; the engineer can retype it.
-    }
-  }, [messageDraft, session, sendMutation]);
+  const handleDraftChange = useCallback((caseId: string, text: string): void => {
+    setDraftByCaseId((current) => ({ ...current, [caseId]: text }));
+  }, []);
 
-  const handleComplete = useCallback(async (): Promise<void> => {
-    if (!session) return;
-    const { caseId, conversationId } = session;
-    setSession(null);
-    clearCachedCurrentCase();
-    try {
-      await completeMutation.mutateAsync({ caseId, conversationId });
-    } catch {
-      // Best-effort — the widget has already cleared locally either way.
-    }
-  }, [session, completeMutation, clearCachedCurrentCase]);
-
-  const handleDraftKeyDown = useCallback(
-    (e: KeyboardEvent<HTMLDivElement>): void => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        void handleSend();
+  const handleSend = useCallback(
+    async (session: ActiveSession): Promise<void> => {
+      const text = (draftByCaseId[session.caseId] ?? "").trim();
+      if (!text) return;
+      const { caseId, conversationId } = session;
+      setDraftByCaseId((current) => ({ ...current, [caseId]: "" }));
+      setCasesByCaseId((current) => {
+        const entry = current[caseId];
+        if (!entry || entry.kind !== "session") return current;
+        return {
+          ...current,
+          [caseId]: {
+            ...entry,
+            messages: [...entry.messages, { id: `engineer-${Date.now()}`, from: "engineer", text }],
+          },
+        };
+      });
+      try {
+        await sendMutation.mutateAsync({ caseId, conversationId, message: text });
+      } catch {
+        // Best-effort optimistic send — a failure just means the customer
+        // never saw this one; the engineer can retype it.
       }
     },
+    [draftByCaseId, sendMutation],
+  );
+
+  const handleComplete = useCallback(
+    async (session: ActiveSession): Promise<void> => {
+      const { caseId, conversationId } = session;
+      setCasesByCaseId((current) => {
+        const next = { ...current };
+        delete next[caseId];
+        return next;
+      });
+      clearCachedCase(caseId);
+      try {
+        await completeMutation.mutateAsync({ caseId, conversationId });
+      } catch {
+        // Best-effort — the widget has already cleared locally either way.
+      }
+    },
+    [completeMutation, clearCachedCase],
+  );
+
+  const handleDraftKeyDown = useCallback(
+    (session: ActiveSession) =>
+      (e: KeyboardEvent<HTMLDivElement>): void => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          void handleSend(session);
+        }
+      },
     [handleSend],
   );
 
-  if (!pending && !session) return null;
+  if (entries.length === 0) return null;
 
   return (
-    <Paper
-      elevation={4}
+    <Stack
+      spacing={1.5}
       sx={{
         position: "fixed",
         bottom: 24,
         right: 24,
         width: 340,
         maxWidth: "calc(100vw - 48px)",
+        maxHeight: "calc(100vh - 48px)",
+        overflowY: "auto",
         zIndex: 1400,
-        display: "flex",
-        flexDirection: "column",
-        overflow: "hidden",
       }}
     >
-      {pending && (
-        <Box sx={{ p: 2 }}>
-          <Stack direction="row" alignItems="flex-start" justifyContent="space-between">
-            <Typography variant="subtitle2" fontWeight={600}>
-              Live engineer requested
-            </Typography>
-            <IconButton
-              size="small"
-              aria-label="Dismiss"
-              onClick={() => void handleDismiss()}
-              disabled={acceptMutation.isPending || declineMutation.isPending}
-            >
-              <Typography component="span" sx={{ fontSize: "1rem", lineHeight: 1 }}>
-                &times;
+      {pendingEntries.map((pending) => {
+        const remainingSeconds = remainingSecondsFor(pending.assignedAt);
+        return (
+          <Paper key={pending.caseId} elevation={4} sx={{ overflow: "hidden" }}>
+            <Box sx={{ p: 2 }}>
+              <Stack direction="row" alignItems="flex-start" justifyContent="space-between">
+                <Typography variant="subtitle2" fontWeight={600}>
+                  Live engineer requested
+                </Typography>
+                <IconButton
+                  size="small"
+                  aria-label="Dismiss"
+                  onClick={() => void handleDismiss(pending)}
+                  disabled={acceptMutation.isPending || declineMutation.isPending}
+                >
+                  <Typography component="span" sx={{ fontSize: "1rem", lineHeight: 1 }}>
+                    &times;
+                  </Typography>
+                </IconButton>
+              </Stack>
+              <Box sx={{ mt: 1 }}>
+                <LinearProgress
+                  variant="determinate"
+                  value={Math.min(100, (remainingSeconds / pendingTimeoutSeconds) * 100)}
+                  color={remainingSeconds <= 10 ? "warning" : "primary"}
+                  sx={{ height: 4, borderRadius: 2 }}
+                />
+                <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: "block" }}>
+                  {remainingSeconds > 0
+                    ? `Auto-reassigns in ${remainingSeconds}s if not accepted`
+                    : "Reassigning any moment…"}
+                </Typography>
+              </Box>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                {pending.customerName || pending.customerEmail || "A customer"} is asking to
+                talk to a live engineer.
               </Typography>
-            </IconButton>
-          </Stack>
-          {remainingSeconds !== null && (
-            <Box sx={{ mt: 1 }}>
-              <LinearProgress
-                variant="determinate"
-                value={Math.min(100, (remainingSeconds / pendingTimeoutSeconds) * 100)}
-                color={remainingSeconds <= 10 ? "warning" : "primary"}
-                sx={{ height: 4, borderRadius: 2 }}
-              />
-              <Typography
-                variant="caption"
-                color="text.secondary"
-                sx={{ mt: 0.5, display: "block" }}
-              >
-                {remainingSeconds > 0
-                  ? `Auto-reassigns in ${remainingSeconds}s if not accepted`
-                  : "Reassigning any moment\u2026"}
-              </Typography>
+              {pending.message && (
+                <Typography
+                  variant="body2"
+                  sx={{
+                    mt: 1,
+                    p: 1,
+                    bgcolor: "action.hover",
+                    borderRadius: 1,
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {pending.message}
+                </Typography>
+              )}
+              <Stack direction="row" spacing={1} sx={{ mt: 1.5 }}>
+                <Button
+                  variant="contained"
+                  color="primary"
+                  size="small"
+                  onClick={() => void handleAccept(pending)}
+                  disabled={acceptMutation.isPending}
+                  startIcon={
+                    acceptMutation.isPending ? <CircularProgress size={14} color="inherit" /> : undefined
+                  }
+                  sx={{ textTransform: "none" }}
+                >
+                  Accept
+                </Button>
+                <Button
+                  variant="text"
+                  size="small"
+                  onClick={() => void handleDismiss(pending)}
+                  disabled={acceptMutation.isPending || declineMutation.isPending}
+                  sx={{ textTransform: "none" }}
+                >
+                  Dismiss
+                </Button>
+              </Stack>
             </Box>
-          )}
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-            {pending.customerName || pending.customerEmail || "A customer"} is
-            asking to talk to a live engineer.
-          </Typography>
-          {pending.message && (
-            <Typography
-              variant="body2"
-              sx={{
-                mt: 1,
-                p: 1,
-                bgcolor: "action.hover",
-                borderRadius: 1,
-                whiteSpace: "pre-wrap",
-                overflowWrap: "anywhere",
-              }}
-            >
-              {pending.message}
-            </Typography>
-          )}
-          <Stack direction="row" spacing={1} sx={{ mt: 1.5 }}>
-            <Button
-              variant="contained"
-              color="primary"
-              size="small"
-              onClick={() => void handleAccept()}
-              disabled={acceptMutation.isPending}
-              startIcon={
-                acceptMutation.isPending ? (
-                  <CircularProgress size={14} color="inherit" />
-                ) : undefined
-              }
-              sx={{ textTransform: "none" }}
-            >
-              Accept
-            </Button>
-            <Button
-              variant="text"
-              size="small"
-              onClick={() => void handleDismiss()}
-              disabled={acceptMutation.isPending || declineMutation.isPending}
-              sx={{ textTransform: "none" }}
-            >
-              Dismiss
-            </Button>
-          </Stack>
-        </Box>
-      )}
+          </Paper>
+        );
+      })}
 
-      {session && (
-        <>
+      {sessionEntries.map((session) => (
+        <Paper key={session.caseId} elevation={4} sx={{ display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <Box sx={{ p: 1.5, borderBottom: 1, borderColor: "divider" }}>
             <Stack direction="row" alignItems="center" justifyContent="space-between">
               <Typography variant="subtitle2" fontWeight={600} noWrap sx={{ pr: 1 }}>
@@ -489,7 +532,7 @@ export default function EngineerAlertNotification(): JSX.Element | null {
                 size="small"
                 variant="outlined"
                 color="inherit"
-                onClick={() => void handleComplete()}
+                onClick={() => void handleComplete(session)}
                 disabled={completeMutation.isPending}
                 sx={{ textTransform: "none" }}
               >
@@ -527,12 +570,8 @@ export default function EngineerAlertNotification(): JSX.Element | null {
                       borderRadius: 1,
                       whiteSpace: "pre-wrap",
                       overflowWrap: "anywhere",
-                      bgcolor:
-                        m.from === "engineer" ? "primary.main" : "action.hover",
-                      color:
-                        m.from === "engineer"
-                          ? "primary.contrastText"
-                          : "text.primary",
+                      bgcolor: m.from === "engineer" ? "primary.main" : "action.hover",
+                      color: m.from === "engineer" ? "primary.contrastText" : "text.primary",
                     }}
                   >
                     {m.text}
@@ -547,25 +586,25 @@ export default function EngineerAlertNotification(): JSX.Element | null {
                 size="small"
                 fullWidth
                 placeholder="Type a message..."
-                value={messageDraft}
-                onChange={(e) => setMessageDraft(e.target.value)}
-                onKeyDown={handleDraftKeyDown}
+                value={draftByCaseId[session.caseId] ?? ""}
+                onChange={(e) => handleDraftChange(session.caseId, e.target.value)}
+                onKeyDown={handleDraftKeyDown(session)}
                 multiline
                 maxRows={3}
               />
               <Button
                 variant="contained"
                 size="small"
-                onClick={() => void handleSend()}
-                disabled={!messageDraft.trim() || sendMutation.isPending}
+                onClick={() => void handleSend(session)}
+                disabled={!(draftByCaseId[session.caseId] ?? "").trim() || sendMutation.isPending}
                 sx={{ textTransform: "none" }}
               >
                 Send
               </Button>
             </Stack>
           </Box>
-        </>
-      )}
-    </Paper>
+        </Paper>
+      ))}
+    </Stack>
   );
 }
