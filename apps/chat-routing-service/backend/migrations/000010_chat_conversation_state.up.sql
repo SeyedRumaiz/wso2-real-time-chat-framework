@@ -14,23 +14,14 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Per the 2026-09-07 DB schema review (see the project's
--- db-schema-review-2026-09-07-outcomes.md doc): chat_conversation had no
--- field saying whether a chat was still ongoing or finished -- "there's no
--- way to confirm whether the chat is ended or still ongoing... the chat
--- conversation table should hold the state of it." Adds that lifecycle
--- field; the actual transition rules stay in application code (Sajith and
--- Mifraz's explicit conclusion), not the database -- this migration only
--- adds the column and enum, it does not encode which state can move to
--- which.
+-- Adds a lifecycle state to chat_conversation -- previously there was no
+-- way to tell an open chat from a finished one. Transition rules live in
+-- application code, not here; this migration only adds the column and enum.
 --
--- Only OPEN -> ACTIVE is wired to any code today (Router.Accept, via
--- setConversationEngineer in internal/router/workitem.go) -- RESOLVED,
--- CONVERTED_CHAT, CONVERTED_CASE, ABANDONED, and CLOSED exist in the enum
--- per the meeting's discussion, but this codebase has no "close this chat"
--- or "convert to a case" feature yet for anything to set them from. They
--- are here so that future work has the column/enum ready rather than
--- needing another migration.
+-- Only OPEN -> ACTIVE is wired up today (Router.Accept). RESOLVED,
+-- CONVERTED_CHAT, CONVERTED_CASE, ABANDONED, and CLOSED exist for features
+-- that don't exist yet, so the column/enum is ready without another
+-- migration later.
 CREATE TYPE chat_routing.chat_conversation_state AS ENUM (
   'OPEN', 'ACTIVE', 'RESOLVED', 'CONVERTED_CHAT', 'CONVERTED_CASE', 'ABANDONED', 'CLOSED'
 );
@@ -38,13 +29,9 @@ CREATE TYPE chat_routing.chat_conversation_state AS ENUM (
 ALTER TABLE chat_routing.chat_conversation
   ADD COLUMN state chat_routing.chat_conversation_state NOT NULL DEFAULT 'OPEN';
 
--- Existing rows: ACTIVE if already accepted (engineer_id set), otherwise
--- still OPEN -- the two states this codebase can actually tell apart today.
+-- Existing rows: ACTIVE if already accepted (engineer_id set), otherwise OPEN.
 UPDATE chat_routing.chat_conversation SET state = 'ACTIVE' WHERE engineer_id IS NOT NULL;
 
--- conversation_id duplicated work_item_id/case_id (both already identify
--- the row) and nothing ever queried by it -- see this migration's sibling
--- Go changes (internal/router/workitem.go, the SDK, and csm-portal/
--- backend's HandleEscalate call site), which stop sending/persisting it
--- entirely rather than leaving an unused required field in the API.
+-- conversation_id duplicated work_item_id/case_id and was never queried by;
+-- dropped along with the Go code that used to send it.
 ALTER TABLE chat_routing.chat_conversation DROP COLUMN conversation_id;

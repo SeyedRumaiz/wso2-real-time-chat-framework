@@ -14,9 +14,8 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Reverts 000005: restores the stored counter columns (zeroed -- the
--- assignment_log's history is not replayed back into them, same
--- ephemeral-state reasoning as 000004's down migration) and drops the log.
+-- Restores the stored counter columns, zeroed -- assignment_log's history
+-- isn't replayed back into them -- and drops the log.
 ALTER TABLE chat_routing.engineers
   ADD COLUMN chats_today       INTEGER NOT NULL DEFAULT 0,
   ADD COLUMN chats_today_date  DATE;

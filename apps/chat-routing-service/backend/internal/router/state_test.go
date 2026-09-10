@@ -14,40 +14,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// These are integration tests: Router is backed by a real *pgxpool.Pool
-// (see NewRouter), not an interface with a fake implementation, so there is
-// no way to exercise its actual SQL without a real PostgreSQL database.
-// newTestRouter below connects using this service's own normal DB_HOST/
-// DB_PORT/DB_USER/DB_PASSWORD/DB_NAME/DB_SSLMODE environment variables (see
-// internal/config.LoadDB and internal/db.NewPool -- the exact same
-// connection setup cmd/server/main.go uses), so run these the same way you
-// run the server itself, e.g. from this directory:
+// These are integration tests: Router is backed by a real *pgxpool.Pool,
+// not an interface with a fake, so there's no way to exercise its SQL
+// without a real Postgres database. newTestRouter connects using this
+// service's own normal DB_* environment variables, so run these the same
+// way you'd run the server itself:
 //
 //	set -a && source .env && set +a && go test ./...
 //
-// If those env vars aren't set, every test here calls t.Skip rather than
-// failing -- "no database configured" is a normal, expected state for
-// `go test ./...` run somewhere without Postgres reachable (CI, a laptop
-// that hasn't set up the dev DB yet), not a test failure.
+// Without those env vars set, every test here calls t.Skip rather than
+// failing -- that's the expected state anywhere Postgres isn't reachable
+// (CI, a laptop without the dev DB set up), not a test failure.
 //
-// These tests run against the SAME chat_routing schema your real dev
-// database and manual curl testing use -- there is no isolated test schema
-// (yet). That's safe because every test here operates only on engineer
-// user IDs and case IDs it generates itself (see testUserID/testCaseID) and
-// cleans up after itself via t.Cleanup, so it can never touch or be
-// confused with a real engineer row (like a live account) or a real queued
-// case. What it deliberately does NOT test is Router.Escalate's own
-// engineer-selection algorithm (least-busy-today ranking) or the exact
-// position a case lands at in the shared queue -- both depend on the full
-// set of every engineer/queue row currently in the shared dev database,
-// which a test generating its own isolated rows has no way to control or
-// predict. Fixture setup below calls assignCaseToEngineer/insertQueueRow
-// directly (this file is in package router, so it can) specifically to
-// sidestep that ambiguity: a test that needs "engineer X is PENDING on case
-// Y" creates exactly that, without going through Escalate's
-// pick-any-available-engineer path at all. Escalate's own selection logic
-// is exercised by the manual multi-engineer curl walkthrough instead (see
-// the project's live-engineer-chat-escalation-summary.md).
+// These run against the same chat_routing schema the real dev database
+// uses -- there's no isolated test schema yet. That's safe because every
+// test here only touches engineer user IDs and case IDs it generates
+// itself (see testUserID/testCaseID) and cleans up via t.Cleanup, so it
+// can never collide with a real account or a real queued case. What this
+// deliberately does not test is Escalate's own engineer-selection ranking
+// or queue position, since both depend on every other row in the shared
+// database, which an isolated test can't control. Fixtures call
+// assignCaseToEngineer/insertQueueRow directly instead of going through
+// Escalate, so a test that needs "engineer X is PENDING on case Y" can
+// build exactly that without picking a real engineer out of the pool.
 package router
 
 import (
@@ -73,7 +62,7 @@ func newTestRouter(t *testing.T) (*Router, *pgxpool.Pool) {
 
 	cfg := config.LoadDB()
 	if err := cfg.Validate(); err != nil {
-		t.Skipf("skipping: chat-routing-service database not configured (%v) -- see this file's package doc comment", err)
+		t.Skipf("skipping: chat-routing-service database not configured (%v)", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -88,12 +77,9 @@ func newTestRouter(t *testing.T) (*Router, *pgxpool.Pool) {
 	return NewRouter(pool), pool
 }
 
-// testUserID returns a collision-free engineer user ID for the calling
-// test, registers it (via SetPresence, so it starts OFFLINE and idle like
-// any engineer's first-ever contact -- see Router.SetPresence's own doc
-// comment), and cleans up every row this test's use of it could have
-// touched (cs_engineer_status, chat_queue_engineer_assignment) once the
-// test finishes, pass or fail.
+// testUserID returns a collision-free engineer user ID, registers it via
+// SetPresence (so it starts OFFLINE and idle, like any engineer's first
+// contact), and cleans up every row it touched once the test finishes.
 func testUserID(t *testing.T, r *Router, pool *pgxpool.Pool, tag string) string {
 	t.Helper()
 	userID := fmt.Sprintf("router-test-%s-%d", tag, time.Now().UnixNano())
@@ -116,11 +102,8 @@ func testUserID(t *testing.T, r *Router, pool *pgxpool.Pool, tag string) string 
 }
 
 // testCaseID returns a collision-free case ID (and matching conversation
-// ID) for the calling test and registers cleanup of any chat_queue row left
-// under it (a test that expects its case to be dequeued during the test
-// doesn't need this to do anything at cleanup time; one that leaves a case
-// queued -- e.g. because an assertion failed first -- won't leak a row into
-// the shared queue).
+// ID) and registers cleanup of any chat_queue row left under it, so a
+// failed assertion doesn't leak a row into the shared queue.
 func testCaseID(t *testing.T, pool *pgxpool.Pool, tag string) string {
 	t.Helper()
 	caseID := fmt.Sprintf("router-test-%s-%d", tag, time.Now().UnixNano())
@@ -138,14 +121,10 @@ func testCaseID(t *testing.T, pool *pgxpool.Pool, tag string) string {
 }
 
 // assignFixture puts userID directly into PENDING on a freshly-built
-// CaseInfo for caseID, bypassing Escalate's engineer-selection entirely
-// (calling the same unexported assignCaseToEngineer Escalate itself uses,
-// directly -- see this file's package doc comment for why), and gives the
-// case a chat_queue row in the ASSIGNED state, matching what Escalate
-// itself would have created (see migrations/000015_redesign_chat_queue's
-// own doc comment: every case gets a queue row from Escalate until
-// Accept). userID must already exist (see testUserID) and not currently
-// hold a case.
+// CaseInfo for caseID, bypassing Escalate's engineer-selection (by calling
+// assignCaseToEngineer directly), and gives the case a chat_queue row in
+// the ASSIGNED state, matching what Escalate would have created. userID
+// must already exist (see testUserID) and not currently hold a case.
 func assignFixture(t *testing.T, r *Router, userID, caseID string) CaseInfo {
 	t.Helper()
 	ci := CaseInfo{CaseID: caseID, ConversationID: "conv-" + caseID}
@@ -167,17 +146,14 @@ func assignFixture(t *testing.T, r *Router, userID, caseID string) CaseInfo {
 }
 
 // engineerRowForTest is the subset of a cs_engineer_status row assertions
-// below check directly, bypassing Router's own public API so a test can
-// confirm what's actually in the database rather than only what a method's
-// return value claims. Status here is the externally-visible/derived value
-// (see externalStatus in state.go) -- PENDING is no longer a value the
-// database itself stores (see migrations/000012_remove_pending_status.up.sql),
-// so reading the raw column would no longer tell these tests what they
-// actually want to know.
+// check directly, bypassing Router's own API so a test can confirm what's
+// actually in the database rather than only what a method's return value
+// claims. Status is the externally-visible/derived value (see
+// externalStatus) -- PENDING isn't a value the database itself stores, so
+// reading the raw column wouldn't tell these tests what they want to know.
 type engineerRowForTest struct {
-	Status         Status
-	CurrentCaseID  *string
-	PendingOffline bool
+	Status        Status
+	CurrentCaseID *string
 }
 
 func getEngineerRow(t *testing.T, pool *pgxpool.Pool, userID string) engineerRowForTest {
@@ -191,8 +167,8 @@ func getEngineerRow(t *testing.T, pool *pgxpool.Pool, userID string) engineerRow
 	)
 	row := engineerRowForTest{}
 	err := pool.QueryRow(ctx, `
-		SELECT chat_status, current_case_id, pending_offline, accepted_at FROM cs_engineer_status WHERE user_id = $1
-	`, userID).Scan(&rawStatus, &row.CurrentCaseID, &row.PendingOffline, &acceptedAt)
+		SELECT chat_status, current_case_id, accepted_at FROM cs_engineer_status WHERE user_id = $1
+	`, userID).Scan(&rawStatus, &row.CurrentCaseID, &acceptedAt)
 	if err != nil {
 		t.Fatalf("read engineer row %s: %v", userID, err)
 	}
@@ -200,18 +176,15 @@ func getEngineerRow(t *testing.T, pool *pgxpool.Pool, userID string) engineerRow
 	return row
 }
 
-// completedSafely calls Router.Completed for userID, and, if that happened
-// to drain a case off the shared chat_queue (result.AssignedCase !=
-// nil), immediately flips it straight back to WAITING_FOR_ENGINEER and
-// clears it off userID directly via SQL -- bypassing Decline/SetPresence
-// entirely to avoid recursively risking the exact same problem. None of
-// this file's fixtures ever leave a WAITING_FOR_ENGINEER row behind before
-// calling this, so a non-nil AssignedCase here can only be a real,
-// pre-existing case that was genuinely waiting in the shared dev
-// database's queue (see this file's package doc comment) -- not test data.
-// Without this, a test's fixture engineer rejoining AVAILABLE could
-// silently steal a real customer's queued escalation, then lose it
-// entirely once that fixture engineer's row is deleted at test cleanup.
+// completedSafely calls Router.Completed for userID, and, if that drained
+// a case off the shared chat_queue (result.AssignedCase != nil),
+// immediately puts it back and clears it off userID directly via SQL.
+// None of this file's fixtures ever leave a WAITING_FOR_ENGINEER row
+// behind, so a non-nil AssignedCase here can only be a real, pre-existing
+// case from the shared dev database's queue -- not test data. Without
+// this, a fixture engineer rejoining AVAILABLE could silently steal a
+// real customer's queued escalation and then lose it once the fixture's
+// row is deleted at cleanup.
 func completedSafely(t *testing.T, r *Router, pool *pgxpool.Pool, userID string) CompletedResult {
 	t.Helper()
 	ctx := context.Background()
@@ -247,6 +220,55 @@ func completedSafely(t *testing.T, r *Router, pool *pgxpool.Pool, userID string)
 	return result
 }
 
+// TestIsStuckPending is a pure unit test -- isStuckPending takes no
+// database connection, so it actually runs anywhere `go test` runs. It
+// checks that an OFFLINE-but-unconfirmed engineer is treated exactly like
+// a BUSY-but-unconfirmed one, so SweepExpiredPending and Accept both keep
+// finding them.
+func TestIsStuckPending(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name       string
+		stored     Status
+		hasCase    bool
+		acceptedAt *time.Time
+		want       bool
+	}{
+		{"busy unconfirmed with case", StatusBusy, true, nil, true},
+		{"busy confirmed", StatusBusy, true, &now, false},
+		{"busy with no case (shouldn't happen, but must not panic/misreport)", StatusBusy, false, nil, false},
+		{"offline unconfirmed with case", StatusOffline, true, nil, true},
+		{"offline confirmed", StatusOffline, true, &now, false},
+		{"offline idle", StatusOffline, false, nil, false},
+		{"available idle", StatusAvailable, false, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isStuckPending(tt.stored, tt.hasCase, tt.acceptedAt); got != tt.want {
+				t.Errorf("isStuckPending(%s, hasCase=%v, accepted=%v) = %v, want %v", tt.stored, tt.hasCase, tt.acceptedAt != nil, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsPendingAccept_ExcludesOffline checks that isPendingAccept, which
+// drives the public-facing PENDING relabeling, stays narrower than
+// isStuckPending: an engineer who's asked to leave must keep reading as
+// OFFLINE externally, not PENDING, even while the timeout sweep and
+// Accept still track their unconfirmed case.
+func TestIsPendingAccept_ExcludesOffline(t *testing.T) {
+	now := time.Now()
+	if isPendingAccept(StatusOffline, true, nil) {
+		t.Error("isPendingAccept must not treat an OFFLINE-but-unconfirmed engineer as pending accept -- they must read as OFFLINE, not PENDING")
+	}
+	if !isPendingAccept(StatusBusy, true, nil) {
+		t.Error("isPendingAccept must still treat a BUSY, unconfirmed engineer as pending accept")
+	}
+	if isPendingAccept(StatusBusy, true, &now) {
+		t.Error("isPendingAccept must not apply once accepted_at is set")
+	}
+}
+
 func TestCompleted_NoOpWhenIdle(t *testing.T) {
 	r, pool := newTestRouter(t)
 	userID := testUserID(t, r, pool, "completed-idle")
@@ -271,21 +293,18 @@ func TestCompleted_NoOpForUnknownUserID(t *testing.T) {
 	}
 }
 
-func TestCompleted_RejoinsAvailableWhenNotPendingOffline(t *testing.T) {
+func TestCompleted_RejoinsAvailableWhenNeverRequestedOffline(t *testing.T) {
 	r, pool := newTestRouter(t)
 	userID := testUserID(t, r, pool, "completed-rejoin")
 	caseID := testCaseID(t, pool, "completed-rejoin")
 	assignFixture(t, r, userID, caseID)
 
-	// Note: if the shared dev database's queue is genuinely non-empty right
-	// now, this WILL legitimately come back with Rejoined + a real
-	// AssignedCase (that's correct behavior, not a bug) -- completedSafely
-	// puts that real case straight back afterward either way. This
-	// assertion is therefore about Removed/Rejoined only, not about the
-	// queue being empty, which this test has no way to guarantee.
+	// If the shared queue is genuinely non-empty, this may legitimately come
+	// back with Rejoined + a real AssignedCase -- completedSafely puts that
+	// back afterward either way. So this only asserts on Removed/Rejoined.
 	result := completedSafely(t, r, pool, userID)
 	if !result.Rejoined || result.Removed {
-		t.Errorf("expected Rejoined (not Removed) with pending_offline never set, got %+v", result)
+		t.Errorf("expected Rejoined (not Removed) when OFFLINE was never requested mid-session, got %+v", result)
 	}
 
 	row := getEngineerRow(t, pool, userID)
@@ -294,7 +313,7 @@ func TestCompleted_RejoinsAvailableWhenNotPendingOffline(t *testing.T) {
 	}
 }
 
-func TestCompleted_GoesOfflineWhenPendingOffline(t *testing.T) {
+func TestCompleted_GoesOfflineWhenOfflineRequestedMidSession(t *testing.T) {
 	r, pool := newTestRouter(t)
 	userID := testUserID(t, r, pool, "completed-offline")
 	caseID := testCaseID(t, pool, "completed-offline")
@@ -304,13 +323,20 @@ func TestCompleted_GoesOfflineWhenPendingOffline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetPresence(OFFLINE) mid-session: %v", err)
 	}
-	if !presenceResult.Applied || !presenceResult.PendingOffline {
-		t.Fatalf("expected Applied+PendingOffline requesting OFFLINE mid-session, got %+v", presenceResult)
+	if !presenceResult.Applied {
+		t.Fatalf("expected Applied requesting OFFLINE mid-session, got %+v", presenceResult)
 	}
-	// Mid-session OFFLINE must not touch the session itself yet.
+	// Mid-session OFFLINE must not touch the session itself, but (unlike the
+	// old deferred pending_offline design) must take effect on chat_status
+	// immediately -- see SetPresence's own doc comment. externalStatus
+	// reports that as OFFLINE, not PENDING, even though the case is still
+	// unconfirmed (see isPendingAccept vs. isStuckPending in state.go).
 	mid := getEngineerRow(t, pool, userID)
 	if mid.CurrentCaseID == nil || *mid.CurrentCaseID != caseID {
 		t.Fatalf("requesting OFFLINE mid-session must not clear the current case yet, got %+v", mid)
+	}
+	if mid.Status != StatusOffline {
+		t.Fatalf("expected chat_status to flip to OFFLINE immediately on a mid-session OFFLINE request, got %+v", mid)
 	}
 
 	result, err := r.Completed(context.Background(), userID)
@@ -318,21 +344,19 @@ func TestCompleted_GoesOfflineWhenPendingOffline(t *testing.T) {
 		t.Fatalf("Completed: %v", err)
 	}
 	if !result.Removed || result.Rejoined || result.AssignedCase != nil {
-		t.Errorf("expected Removed (offline, no rejoin) once pending_offline was set, got %+v", result)
+		t.Errorf("expected Removed (offline, no rejoin) once OFFLINE was requested mid-session, got %+v", result)
 	}
 
 	row := getEngineerRow(t, pool, userID)
-	if row.Status != StatusOffline || row.CurrentCaseID != nil || row.PendingOffline {
-		t.Errorf("expected OFFLINE, no current case, pending_offline cleared, got %+v", row)
+	if row.Status != StatusOffline || row.CurrentCaseID != nil {
+		t.Errorf("expected OFFLINE with no current case after Completed, got %+v", row)
 	}
 }
 
 func TestCompleted_DuplicateCallIsIdempotent(t *testing.T) {
-	// This is the exact 2026-09-04 bug: a second Completed call for a
-	// session that already ended used to re-derive AVAILABLE-vs-OFFLINE
-	// from pending_offline's value AFTER the first call had already reset
-	// it, silently overwriting a correct OFFLINE result back to AVAILABLE.
-	// See Router.Completed's own doc comment for the current guard.
+	// Regression guard: a second Completed call for a session that already
+	// ended must not re-derive AVAILABLE-vs-OFFLINE and silently overwrite a
+	// correct OFFLINE result back to AVAILABLE.
 	r, pool := newTestRouter(t)
 	userID := testUserID(t, r, pool, "completed-duplicate")
 	caseID := testCaseID(t, pool, "completed-duplicate")
@@ -364,7 +388,7 @@ func TestCompleted_DuplicateCallIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestSetPresence_ChangingMindClearsPendingOffline(t *testing.T) {
+func TestSetPresence_ChangingMindUndoesMidSessionOffline(t *testing.T) {
 	r, pool := newTestRouter(t)
 	userID := testUserID(t, r, pool, "presence-change-mind")
 	caseID := testCaseID(t, pool, "presence-change-mind")
@@ -373,23 +397,33 @@ func TestSetPresence_ChangingMindClearsPendingOffline(t *testing.T) {
 	if _, err := r.SetPresence(context.Background(), userID, StatusOffline); err != nil {
 		t.Fatalf("SetPresence(OFFLINE): %v", err)
 	}
+	offline := getEngineerRow(t, pool, userID)
+	if offline.Status != StatusOffline {
+		t.Fatalf("expected chat_status OFFLINE immediately after the mid-session request, got %+v", offline)
+	}
+
 	result, err := r.SetPresence(context.Background(), userID, StatusAvailable)
 	if err != nil {
 		t.Fatalf("SetPresence(AVAILABLE) to change their mind: %v", err)
 	}
-	if !result.Applied || result.PendingOffline {
-		t.Errorf("expected pending_offline cleared by requesting AVAILABLE mid-session, got %+v", result)
+	if !result.Applied {
+		t.Errorf("expected Applied undoing a mid-session OFFLINE request, got %+v", result)
 	}
 
-	// The session itself must still be untouched by either presence call.
+	// The session itself must still be untouched by either presence call,
+	// and chat_status must be back to BUSY -- reported externally as
+	// PENDING, since the case is still unconfirmed (see isPendingAccept).
 	mid := getEngineerRow(t, pool, userID)
-	if mid.CurrentCaseID == nil || *mid.CurrentCaseID != caseID || mid.PendingOffline {
-		t.Fatalf("expected session untouched and pending_offline cleared, got %+v", mid)
+	if mid.CurrentCaseID == nil || *mid.CurrentCaseID != caseID {
+		t.Fatalf("expected session untouched by SetPresence, got %+v", mid)
+	}
+	if mid.Status != StatusPending {
+		t.Errorf("expected chat_status reverted to BUSY (external PENDING, case still unconfirmed) after changing their mind, got %+v", mid)
 	}
 
 	completedResult := completedSafely(t, r, pool, userID)
 	if !completedResult.Rejoined || completedResult.Removed {
-		t.Errorf("expected AVAILABLE rejoin after clearing pending_offline, got %+v", completedResult)
+		t.Errorf("expected AVAILABLE rejoin after undoing the mid-session OFFLINE request, got %+v", completedResult)
 	}
 }
 
@@ -490,6 +524,60 @@ func TestAccept_RejectsDoubleAccept(t *testing.T) {
 	}
 }
 
+// TestAccept_AppliesWhenOfflineButUnconfirmed is the integration-level
+// counterpart to TestIsStuckPending: it checks that Accept applies for an
+// OFFLINE-but-unconfirmed engineer without forcing chat_status back to
+// BUSY, against a real database connection.
+func TestAccept_AppliesWhenOfflineButUnconfirmed(t *testing.T) {
+	r, pool := newTestRouter(t)
+	userID := testUserID(t, r, pool, "accept-offline-unconfirmed")
+	caseID := testCaseID(t, pool, "accept-offline-unconfirmed")
+	assignFixture(t, r, userID, caseID)
+
+	if _, err := r.SetPresence(context.Background(), userID, StatusOffline); err != nil {
+		t.Fatalf("SetPresence(OFFLINE) mid-session: %v", err)
+	}
+	offline := getEngineerRow(t, pool, userID)
+	if offline.Status != StatusOffline {
+		t.Fatalf("expected chat_status OFFLINE immediately after the mid-session request, got %+v", offline)
+	}
+
+	result, err := r.Accept(context.Background(), userID, caseID)
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	if !result.Applied {
+		t.Fatalf("expected Accept to apply for an OFFLINE-but-unconfirmed engineer's own case, got %+v", result)
+	}
+
+	// Accept must not force chat_status back to BUSY -- the engineer's
+	// stated intent to leave (see SetPresence) must survive the accept and
+	// only be honored once the session actually ends (see Completed).
+	row := getEngineerRow(t, pool, userID)
+	if row.Status != StatusOffline || row.CurrentCaseID == nil || *row.CurrentCaseID != caseID {
+		t.Errorf("expected Accept to leave chat_status OFFLINE (not force BUSY) while keeping the current case, got %+v", row)
+	}
+
+	var queueRows int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM chat_queue WHERE chat_conversation_id = $1`, "conv-"+caseID).Scan(&queueRows); err != nil {
+		t.Fatalf("check queue row removed: %v", err)
+	}
+	if queueRows != 0 {
+		t.Errorf("expected Accept to delete the case's chat_queue row even for an OFFLINE-but-unconfirmed engineer, but %d remain", queueRows)
+	}
+
+	// Ending the session now must remove them (OFFLINE, no rejoin) --
+	// Completed's existing OFFLINE branch, exercised once more here right
+	// after an Accept in between.
+	completedResult, err := r.Completed(context.Background(), userID)
+	if err != nil {
+		t.Fatalf("Completed: %v", err)
+	}
+	if !completedResult.Removed || completedResult.Rejoined {
+		t.Errorf("expected Completed to remove (not rejoin) an engineer who went OFFLINE before accepting, got %+v", completedResult)
+	}
+}
+
 func TestDecline_NoOpForStaleCaseID(t *testing.T) {
 	r, pool := newTestRouter(t)
 	userID := testUserID(t, r, pool, "decline-stale")
@@ -562,12 +650,10 @@ func TestEnqueue_WaitingFlipsToAssignedAndKeepsCreatedAt(t *testing.T) {
 	}
 
 	// requeueWaiting must flip a claimed row back to WAITING_FOR_ENGINEER
-	// WITHOUT touching created_at, so it keeps its original place ahead of
-	// anything that arrives later -- exercised directly against backCase's
-	// own row (bypassing claimOldestWaiting here, since the shared dev
-	// database's real queue contents could claim a different row first --
-	// see this file's package doc comment) rather than asserting on
-	// whichever case happens to be claimed.
+	// without touching created_at, so it keeps its original place ahead of
+	// anything that arrives later. Exercised directly against backCase's own
+	// row rather than via claimOldestWaiting, since the real queue could
+	// claim a different row first.
 	err = r.withTx(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `UPDATE chat_queue SET status = 'ASSIGNED' WHERE chat_conversation_id = $1`, backCase.ConversationID); err != nil {
 			return err
@@ -588,5 +674,66 @@ func TestEnqueue_WaitingFlipsToAssignedAndKeepsCreatedAt(t *testing.T) {
 	}
 	if !afterCreatedAt.Equal(backCreatedAt) {
 		t.Errorf("expected requeueWaiting to leave created_at untouched, got before=%v after=%v", backCreatedAt, afterCreatedAt)
+	}
+}
+
+// TestTimeoutOne_ReassignsOfflineButUnconfirmedEngineer is the regression
+// test for the bug pending_offline's removal fixes: an engineer who went
+// OFFLINE mid-session before confirming their case would otherwise drop
+// out of the timeout sweep entirely once OFFLINE started taking immediate
+// effect on chat_status, stranding their case. Calls timeoutOne directly
+// (not the full sweep) so this only ever touches its own fixture engineer,
+// never a real one in the shared dev database. Backdates updated_at via
+// SQL instead of waiting out a real timeout.
+func TestTimeoutOne_ReassignsOfflineButUnconfirmedEngineer(t *testing.T) {
+	r, pool := newTestRouter(t)
+	ctx := context.Background()
+	userID := testUserID(t, r, pool, "timeout-offline")
+	caseID := testCaseID(t, pool, "timeout-offline")
+	assignFixture(t, r, userID, caseID)
+
+	if _, err := r.SetPresence(ctx, userID, StatusOffline); err != nil {
+		t.Fatalf("SetPresence(OFFLINE) mid-session: %v", err)
+	}
+	offline := getEngineerRow(t, pool, userID)
+	if offline.Status != StatusOffline {
+		t.Fatalf("expected chat_status OFFLINE immediately after the mid-session request, got %+v", offline)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE cs_engineer_status SET updated_at = now() - interval '1 hour' WHERE user_id = $1
+	`, userID); err != nil {
+		t.Fatalf("backdate updated_at to simulate a real timeout: %v", err)
+	}
+
+	result, err := r.timeoutOne(ctx, userID, caseID, time.Minute)
+	if err != nil {
+		t.Fatalf("timeoutOne: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("expected timeoutOne to fire for an OFFLINE-but-unconfirmed engineer past the timeout -- this is exactly the case pending_offline's removal could have silently dropped from the sweep")
+	}
+	if result.ReassignedTo != "" {
+		// Might be a real engineer in the shared dev database -- rescue them
+		// exactly like completedSafely does elsewhere in this file, so this
+		// test can never leave a real account holding fake test data.
+		reassignedTo := result.ReassignedTo
+		t.Cleanup(func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := pool.Exec(cleanupCtx, `
+				UPDATE cs_engineer_status
+				SET chat_status = 'AVAILABLE', accepted_at = NULL, current_case_id = NULL, current_case = NULL,
+				    available_since = now(), updated_at = now()
+				WHERE user_id = $1
+			`, reassignedTo); err != nil {
+				t.Logf("rescue: restore reassigned engineer %s: %v", reassignedTo, err)
+			}
+		})
+	}
+
+	row := getEngineerRow(t, pool, userID)
+	if row.Status != StatusOffline || row.CurrentCaseID != nil {
+		t.Errorf("expected the timed-out engineer to end up OFFLINE with no current case, got %+v", row)
 	}
 }

@@ -14,53 +14,27 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- 2026-09-07 DB schema review's chat_queue redesign (see the project's
--- db-schema-review-2026-09-07-outcomes.md doc and its own full transcript,
--- around "work item is the one having a UU ID... you can make it uh what is
--- this big serial", "So once the chat is accepted... are we deleting from
--- this?" / "Yes.", and "we can just get the order [position] by sorting
--- with the created time"):
+-- Redesigns chat_queue around a natural key: chat_conversation_id (this
+-- service's existing CaseInfo.ConversationID, already available at
+-- Router.Escalate time) replaces the bigserial id PK.
 --
---   - The bigserial `id` PK is dropped in favor of a natural key: the
---     chat's own conversation identifier, chat_conversation_id (this
---     service's existing CaseInfo.ConversationID -- already available at
---     Router.Escalate time, unlike the LOCAL STAND-IN chat_conversation
---     table's own work_item_id, which does not exist yet at that point --
---     see internal/router/workitem.go's package doc comment).
---   - `status` is now a 2-value enum, WAITING_FOR_ENGINEER / ASSIGNED --
---     "here it has only two values right waiting for engineer and engineer
---     [as]signed. That's it." ONE row now exists per escalation from the
---     moment it's created (Router.Escalate) until Router.Accept confirms
---     the engineer -- not only while it is genuinely waiting -- and is
---     deleted only then. That is what makes plain (created_at,
---     chat_conversation_id) ordering enough on its own: a row that gets
---     reassigned (Decline, a timeout sweep) or handed to a newly-available
---     engineer (SetPresence/Completed's queue-drain) is only ever UPDATEd
---     in place, never deleted and re-inserted, so it keeps its ORIGINAL
---     created_at -- exactly the FRONT-of-queue priority the old
---     order_key/requeued mechanism (000002, 000008) existed to provide,
---     with no extra bookkeeping column needed at all.
---   - `requeued` (000008) is dropped along with it -- superseded by the
---     above.
+-- status is now a 2-value enum, WAITING_FOR_ENGINEER / ASSIGNED. One row
+-- exists per escalation from creation (Router.Escalate) until Router.Accept
+-- confirms the engineer, and is only ever updated in place -- never deleted
+-- and re-inserted -- until it's finally removed. That keeps its original
+-- created_at through a decline, timeout, or reassignment, which is what
+-- makes plain (created_at, chat_conversation_id) ordering enough on its
+-- own. `requeued` (added in 000002/000008) is dropped along with it,
+-- superseded by the same behavior.
 --
--- Deliberate deviation from the review: the meeting also concluded the old
--- `case_info` JSONB blob duplicates data that already lives in "the case
--- table" ("I think you're duplicating lot of info like case info is not
--- required right because that's in the case table") and should be dropped.
--- That reasoning assumes a real, queryable case/work-item table this
--- service can read from at dequeue time. This service has no such table
--- reachable today: entity-service's real case data lives in a separate
--- service, and even this feature's own LOCAL STAND-IN work_item/
--- chat_conversation tables aren't populated until AFTER Router.Escalate
--- returns (csm-portal/backend's HandleEscalate calls CreateWorkItem only
--- once Escalate has already assigned-or-queued the case). Dropping
--- case_info here with nothing to reconstruct it from would mean a customer
--- waiting in the queue -- or handed to a freshly-available engineer via the
--- queue-drain path -- loses their subject/message/customer name the moment
--- they're queued. case_info is kept for that reason (flagged here, and in
--- this service's README, so it doesn't read as an oversight) and should be
--- revisited once this service's LOCAL STAND-IN tables are retired in favor
--- of entity-service's real, atomically-created work item.
+-- case_info (JSONB) is kept even though it duplicates data that will
+-- eventually live in a real case table, because no such table is queryable
+-- from this service yet: entity-service's case data lives elsewhere, and
+-- this service's own stand-in work_item/chat_conversation tables aren't
+-- populated until after Router.Escalate returns. Dropping case_info now
+-- would mean a queued customer loses their subject/message/name. Revisit
+-- once those stand-in tables are retired in favor of entity-service's real
+-- work item.
 CREATE TYPE chat_routing.chat_queue_status AS ENUM ('WAITING_FOR_ENGINEER', 'ASSIGNED');
 
 CREATE TABLE chat_routing.chat_queue_new (
@@ -70,16 +44,12 @@ CREATE TABLE chat_routing.chat_queue_new (
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- In-flight rows (there should be none in a normal deploy window, but a
--- migration must not silently drop live queue state): carried across using
--- case_id as the new natural key -- this service's case identifier and its
--- conversation identifier were, in practice, always the same value passed
--- straight through from CaseInfo.CaseID before this migration (see
--- internal/router/state.go's own enqueueCase). Every carried-over row is
--- conservatively marked WAITING_FOR_ENGINEER: the old table's own shape
--- can't tell us which rows had already been handed to an engineer (that was
--- never what it tracked -- a popped row was deleted, full stop), and
--- guessing ASSIGNED risks a customer being silently dropped if wrong.
+-- Carry over any in-flight rows using case_id as the new natural key --
+-- case_id and conversation_id were always the same value in practice (see
+-- enqueueCase in internal/router/state.go). Every row is marked
+-- WAITING_FOR_ENGINEER conservatively: the old shape can't tell us which
+-- rows were already handed to an engineer, and guessing ASSIGNED risks
+-- silently dropping a customer.
 INSERT INTO chat_routing.chat_queue_new (chat_conversation_id, case_info, status, created_at)
 SELECT case_id, case_info, 'WAITING_FOR_ENGINEER', created_at FROM chat_routing.chat_queue
 ON CONFLICT (chat_conversation_id) DO NOTHING;

@@ -14,51 +14,38 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Per the 2026-09-07 DB schema review (see the project's
--- db-schema-review-2026-09-07-outcomes.md doc): "pending" (and "pending
--- offline") should not be values in the engineer status enum -- they
--- should be derivable instead. pending_offline already was a plain
--- boolean column, never an enum value, so that half of the conclusion was
--- already true going into this migration. PENDING, added by
--- 000006_add_pending_status.up.sql, is a real enum value and comes out
--- here.
+-- Removes PENDING from the engineer status enum (added in 000006) --
+-- pending status should be derivable rather than stored directly.
+-- pending_offline was already a plain boolean, not an enum value, so only
+-- PENDING needs to go here.
 --
--- What PENDING actually distinguished from BUSY was "has this assignment
--- been confirmed by Router.Accept yet" -- a fact this migration keeps as a
--- new accepted_at TIMESTAMPTZ column instead of a fourth enum value: an
--- engineer with current_case_id set and accepted_at still NULL is pending;
--- once Accept runs, accepted_at is set and they read as genuinely BUSY.
--- See internal/router/state.go's new isPendingAccept/externalStatus
--- helpers, used everywhere this package used to compare status directly
--- against StatusPending.
+-- What PENDING actually meant was "assignment not yet confirmed by
+-- Router.Accept". That's tracked now with a new accepted_at TIMESTAMPTZ
+-- column instead of a fourth enum value: current_case_id set with
+-- accepted_at still NULL means pending; once Accept runs, accepted_at is
+-- set and the engineer reads as genuinely BUSY. See the isPendingAccept/
+-- externalStatus helpers in internal/router/state.go.
 --
--- Deliberately NOT derived from chat_conversation.state (added by
--- 000010, also OPEN-until-Accept/ACTIVE-after) even though that would
--- look similar: chat_conversation is an explicitly temporary LOCAL
--- STAND-IN table (see internal/router/workitem.go's package doc comment)
--- slated for deletion once entity-service's real schema ships, and every
--- write to it is best-effort from this package's point of view (a failed
--- CreateWorkItem must never block real routing/timeout behavior -- see
--- Router.Accept's own doc comment). Making the core availability state
--- machine's PENDING/BUSY distinction depend on that table would mean an
--- engineer could get stuck showing BUSY forever (never timing out) simply
--- because their case's stand-in row failed to write. accepted_at lives on
--- engineers itself instead, so this real, permanent table's own state
--- machine has no dependency on the stand-in.
+-- This is deliberately not derived from chat_conversation.state (added in
+-- 000010) even though it looks similar. chat_conversation is a temporary
+-- stand-in table and every write to it is best-effort -- a failed write
+-- must never block real routing/timeout behavior. Tying the engineers
+-- table's PENDING/BUSY distinction to it could leave an engineer stuck
+-- showing BUSY forever if their case's stand-in row never got written.
+-- accepted_at lives on engineers itself so this table's state machine has
+-- no dependency on the stand-in.
 --
 -- Postgres has no ALTER TYPE ... DROP VALUE, so the enum is rebuilt:
--- create the 3-value type, migrate the column across it (mapping any
--- existing PENDING row to BUSY, with accepted_at backfilled per the two
--- ADD COLUMN/UPDATE statements below so already-accepted sessions aren't
--- mistaken for newly-pending ones), then swap the type in under the old
--- name.
+-- create the 3-value type, migrate the column across it (mapping existing
+-- PENDING rows to BUSY, backfilling accepted_at below so already-accepted
+-- sessions aren't mistaken for newly-pending ones), then swap it in under
+-- the old name.
 ALTER TABLE chat_routing.engineers ADD COLUMN accepted_at TIMESTAMPTZ;
 
--- Backfill: a row already BUSY (accepted) keeps looking accepted --
--- approximate accepted_at as updated_at, the closest thing to an actual
--- accept timestamp this table has. A row currently PENDING is left NULL
--- (accepted_at IS NULL is exactly what "pending" now means), and idle
--- engineers keep NULL too (current_case_id is NULL for them regardless).
+-- Backfill: a row already BUSY with a case keeps looking accepted, using
+-- updated_at as the closest approximation of the real accept time. PENDING
+-- rows are left NULL (that's exactly what "pending" now means), same as
+-- idle engineers.
 UPDATE chat_routing.engineers SET accepted_at = updated_at
 WHERE status = 'BUSY' AND current_case_id IS NOT NULL;
 
@@ -67,12 +54,12 @@ CREATE TYPE chat_routing.engineer_status_new AS ENUM ('AVAILABLE', 'BUSY', 'OFFL
 ALTER TABLE chat_routing.engineers ALTER COLUMN status DROP DEFAULT;
 
 -- chk_available_since_only_when_available and idx_engineers_available_since
--- both embed a 'AVAILABLE' literal compiled against the OLD engineer_status
--- type. Postgres re-validates both against the column's NEW type as part of
--- the ALTER COLUMN ... TYPE below, and that re-validation compares the two
--- enum types directly (engineer_status_new = engineer_status) rather than
--- re-compiling the literal, which fails with "operator does not exist".
--- Dropped here, recreated below once the type swap is complete.
+-- both embed an 'AVAILABLE' literal compiled against the old engineer_status
+-- type. The ALTER COLUMN ... TYPE below re-validates them against the new
+-- type by comparing the two enum types directly (engineer_status_new =
+-- engineer_status) rather than re-compiling the literal, which fails with
+-- "operator does not exist". Drop both here, recreate them once the type
+-- swap is done.
 ALTER TABLE chat_routing.engineers DROP CONSTRAINT chk_available_since_only_when_available;
 DROP INDEX chat_routing.idx_engineers_available_since;
 

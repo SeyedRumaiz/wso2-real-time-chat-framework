@@ -14,29 +14,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// This file implements a LOCAL STAND-IN for entity-service's incoming
-// generic WORK_ITEM supertype schema (work_item / chat_conversation /
-// comment) -- see migrations/000007_create_chat_stub_workitem_tables and
-// the project's chat-persistence-mapping-plan.md doc for the full context.
-// Sajith Ekanayaka described that real schema as still evolving; these
-// three tables reproduce his interim shape inside this service's own
-// database purely so this feature's message and engineer-assignment
-// persistence can be built and tested today. Once entity-service's real
-// version ships, csm-portal/backend's calls should move there instead, and
-// everything in this file (plus migrations/000007) should be deleted.
+// This file is a local stand-in for entity-service's generic work-item
+// schema (work_item / chat_conversation / comment), reproduced here so
+// this feature's message and engineer-assignment persistence can be built
+// and tested before that real schema exists. Once entity-service ships its
+// own version, csm-portal/backend's calls should move there instead, and
+// this file (plus its migration) should be deleted.
 //
-// These tables live in this service's own "chat_routing" Postgres schema,
-// same as everything else in this package (engineers, chat_queue,
-// ...) -- resolved via this service's own search_path (see internal/
-// config.Schema / internal/db.NewPool), so every query below uses plain
-// unqualified table names. A version of this that instead put these three
-// tables in entity-service's own schema was tried and reverted on
-// 2026-09-03 -- see the migration's own doc comment and the project's
-// chat-persistence-mapping-plan.md for why: two services each owning their
-// own schema is a sound, normal pattern, and keeping this stand-in fully
-// inside chat-routing-service's own schema/migration history avoids any
-// version or table-name collision with entity-service's own eventual real
-// work_item/chat_conversation/comment migration.
+// These tables live in this service's own "chat_routing" schema rather
+// than entity-service's, so every query below uses plain unqualified table
+// names resolved via this service's own search_path. Keeping them here
+// also means entity-service's eventual real migration can't collide with
+// this stand-in on table names.
 package router
 
 import (
@@ -56,26 +45,18 @@ type WorkItem struct {
 	WorkItemNumber string `json:"workItemNumber,omitempty"`
 }
 
-// ChatConversation mirrors the interim chat_conversation row. CaseID is
-// this stand-in's own addition -- not confirmed as part of the eventual
-// real schema (see the mapping doc's open questions) -- added here because
-// chat_conversation is exactly where Sajith said this feature's own
-// attributes belong, and CaseID is what every caller of AddComment/Accept
-// actually has on hand to look a conversation up by. ConversationID used to
-// be a column here too; the 2026-09-07 DB schema review concluded it
-// duplicated WorkItemID/CaseID (both already identify the row, and nothing
-// ever queried by it) -- see migrations/000010_chat_conversation_state.up.sql's
-// own doc comment.
+// ChatConversation mirrors the interim chat_conversation row. CaseID isn't
+// part of entity-service's eventual real schema -- it's here because every
+// caller of AddComment/Accept looks a conversation up by it.
 type ChatConversation struct {
 	WorkItemID string `json:"workItemId"`
 	CaseID     string `json:"caseId"`
-	// EngineerID is nil until Router.Accept confirms the engineer.
-	EngineerID *string `json:"engineerId,omitempty"`
-	// State is this conversation's lifecycle stage (OPEN until Router.Accept
-	// moves it to ACTIVE -- see setConversationEngineer). RESOLVED/
-	// CONVERTED_CHAT/CONVERTED_CASE/ABANDONED/CLOSED exist in the database
-	// enum per the schema review's discussion, but nothing in this codebase
-	// sets them yet -- see migrations/000010's own doc comment.
+	// AssigneeID is nil until Router.Accept confirms the engineer.
+	AssigneeID *string `json:"assigneeId,omitempty"`
+	// State is this conversation's lifecycle stage: OPEN until Accept moves
+	// it to ACTIVE (see setConversationAssignee). The database enum also
+	// has RESOLVED/CONVERTED_CHAT/CONVERTED_CASE/ABANDONED/CLOSED, but
+	// nothing sets those yet.
 	State string `json:"state"`
 }
 
@@ -95,15 +76,12 @@ type WorkItemDetail struct {
 	Comments []Comment `json:"comments"`
 }
 
-// CreateWorkItem creates the work_item + chat_conversation pair (the
-// conversation starts in state OPEN -- see migrations/000010) for a
-// brand-new escalation, plus its first comment (the message that triggered
-// it, if non-empty). Called once from csm-portal/backend's HandleEscalate
-// regardless of whether Router.Escalate assigns or queues the case -- the
-// work item and its conversation exist the moment the case does, independent
-// of routing outcome. caseID must not already have a chat_conversation row;
-// this is a create, not an upsert -- calling it twice for the same caseID
-// is a caller bug this method does not try to reconcile.
+// CreateWorkItem creates the work_item + chat_conversation pair (starting
+// in state OPEN) for a brand-new escalation, plus its first comment if the
+// triggering message is non-empty. Called once per case regardless of
+// whether Escalate assigns or queues it -- routing outcome doesn't affect
+// whether the record exists. This is a create, not an upsert: calling it
+// twice for the same caseID is a caller bug this doesn't try to reconcile.
 func (r *Router) CreateWorkItem(ctx context.Context, caseID, creatorEmail, subject, initialMessage string) error {
 	return r.withTx(ctx, func(tx pgx.Tx) error {
 		var workItemID string
@@ -133,37 +111,28 @@ func (r *Router) CreateWorkItem(ctx context.Context, caseID, creatorEmail, subje
 	})
 }
 
-// setConversationEngineer records which engineer accepted caseID's chat --
-// called from Accept (see state.go), in the SAME transaction as the
-// PENDING -> BUSY flip, so the two can never disagree about whether an
-// accept actually went through. A no-op if caseID has no chat_conversation
-// row (e.g. this stand-in was added after some in-flight cases already
-// existed) -- Accept's own PENDING/caseID check is the real authority on
-// whether the accept itself is valid; this is just where the byproduct of
-// a valid accept gets recorded. engineerUserID is the IdP "userid" claim
-// (see migrations/000014_rename_engineer_status_table) -- this column held
-// an email before that migration, and is unchanged here beyond the value
-// now written into it.
-func setConversationEngineer(ctx context.Context, tx pgx.Tx, caseID, engineerUserID string) error {
+// setConversationAssignee records which engineer accepted caseID's chat.
+// Called from Accept in the same transaction as the PENDING -> BUSY flip,
+// so the two can never disagree about whether an accept went through. A
+// no-op if caseID has no chat_conversation row -- Accept's own PENDING/
+// caseID check is the real authority on whether the accept is valid; this
+// just records the byproduct of a valid one.
+func setConversationAssignee(ctx context.Context, tx pgx.Tx, caseID, assigneeUserID string) error {
 	if _, err := tx.Exec(ctx, `
-		UPDATE chat_conversation SET engineer_id = $1, state = 'ACTIVE', updated_at = now()
+		UPDATE chat_conversation SET assignee_id = $1, state = 'ACTIVE', updated_at = now()
 		WHERE case_id = $2
-	`, engineerUserID, caseID); err != nil {
-		return fmt.Errorf("set conversation engineer: %w", err)
+	`, assigneeUserID, caseID); err != nil {
+		return fmt.Errorf("set conversation assignee: %w", err)
 	}
 	return nil
 }
 
 // AddComment appends one message to caseID's transcript, looking up its
-// work_item via chat_conversation.case_id. Used for BOTH directions of the
-// live chat (see csm-portal/backend's HandleCustomerMessage and
-// HandleEngineerMessage) so the whole transcript ends up in one place
-// instead of split across two storage systems -- matching Sajith's own
-// description of one shared comment mechanism rather than a per-type one.
-// Returns an error (not a silent no-op) if caseID has no chat_conversation
-// row, since that means CreateWorkItem was never called for it -- a real
-// bug worth surfacing even though today's callers of this method still
-// treat the call itself as best-effort.
+// work_item via chat_conversation.case_id. Used for both directions of the
+// live chat so the whole transcript ends up in one place. Returns an error
+// rather than a silent no-op if caseID has no chat_conversation row, since
+// that means CreateWorkItem was never called for it -- worth surfacing
+// even though current callers still treat this call as best-effort.
 func (r *Router) AddComment(ctx context.Context, caseID, authorEmail, content string) error {
 	return r.withTx(ctx, func(tx pgx.Tx) error {
 		var workItemID string
@@ -186,23 +155,22 @@ func (r *Router) AddComment(ctx context.Context, caseID, authorEmail, content st
 	})
 }
 
-// DebugWorkItem returns caseID's full work item + chat conversation +
-// comment transcript, in order -- verification-only, mirroring DebugState's
-// own reason for existing (see that method's doc comment).
+// DebugWorkItem returns caseID's full work item, chat conversation, and
+// comment transcript in order -- for verification/debugging only.
 func (r *Router) DebugWorkItem(ctx context.Context, caseID string) (WorkItemDetail, error) {
 	var (
 		detail     WorkItemDetail
-		engineerID *string
+		assigneeID *string
 	)
 	err := r.db.QueryRow(ctx, `
 		SELECT w.id, w.creator_id, w.subject, COALESCE(w.work_item_number, ''),
-		       c.work_item_id, c.case_id, c.engineer_id, c.state
+		       c.work_item_id, c.case_id, c.assignee_id, c.state
 		FROM chat_conversation c
 		JOIN work_item w ON w.id = c.work_item_id
 		WHERE c.case_id = $1
 	`, caseID).Scan(
 		&detail.WorkItem.ID, &detail.WorkItem.CreatorID, &detail.WorkItem.Subject, &detail.WorkItem.WorkItemNumber,
-		&detail.Conversation.WorkItemID, &detail.Conversation.CaseID, &engineerID, &detail.Conversation.State,
+		&detail.Conversation.WorkItemID, &detail.Conversation.CaseID, &assigneeID, &detail.Conversation.State,
 	)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -210,7 +178,7 @@ func (r *Router) DebugWorkItem(ctx context.Context, caseID string) (WorkItemDeta
 	case err != nil:
 		return WorkItemDetail{}, fmt.Errorf("debug work item: %w", err)
 	}
-	detail.Conversation.EngineerID = engineerID
+	detail.Conversation.AssigneeID = assigneeID
 
 	rows, err := r.db.Query(ctx, `
 		SELECT id, content, created_by, created_at FROM comment

@@ -17,30 +17,21 @@
 // Package router implements the engineer-availability/queue state machine
 // for the live-engineer-chat routing feature: engineers are AVAILABLE,
 // PENDING (assigned, not yet accepted), BUSY (accepted, in-progress), or
-// OFFLINE. An escalation is assigned to whichever AVAILABLE engineer has
-// taken the fewest chats today (ties broken by who's been AVAILABLE
-// longest), or queued FIFO if nobody qualifies; a completed session drains
-// the queue. See Router.Escalate's own doc comment for the full assignment
-// logic and Router's for the rest of the state machine. A per-customer
-// "sticky" preference (try to reconnect a customer to whoever last handled
-// them) used to be tried first -- dropped per the 2026-09-07 DB schema
-// review as fully derivable, unnecessary state (see migrations/000013's
-// own doc comment).
+// OFFLINE. An escalation goes to whichever AVAILABLE engineer has taken the
+// fewest chats today (ties broken by who's been AVAILABLE longest), or gets
+// queued FIFO if nobody qualifies; a completed session drains the queue.
+// See Router.Escalate for the assignment logic and Router itself for the
+// rest of the state machine.
 //
-// Engineers are identified by their IdP "userid" claim (see migrations/
-// 000014_rename_engineer_status_table) -- this package stores no email of
-// its own; a caller that needs one already has it from its own
-// authenticated session (see csm-portal/backend's internal/middleware.
-// UserInfo).
+// Engineers are identified by their IdP "userid" claim -- this package
+// stores no email of its own; a caller that needs one already has it from
+// its own authenticated session.
 //
-// Backed by PostgreSQL (see this service's migrations/ and internal/db) --
-// engineer presence and the escalation queue both survive a restart and,
-// since every state transition is a transaction against a shared database
-// rather than an in-process mutex, this is also safe for multiple replicas
-// of this service to run against the same database concurrently. The one
-// limitation that predates this and remains: no timeout/reassignment if an
-// assigned engineer never accepts or goes unreachable -- that stays a
-// prototype gap, unrelated to where the state lives.
+// Backed by PostgreSQL, so engineer presence and the queue survive a
+// restart, and multiple replicas of this service can run against the same
+// database safely since every state transition is a transaction rather
+// than an in-process mutex. An assigned engineer who never accepts is
+// caught by the timeout sweep in timeout.go, not left stuck forever.
 package router
 
 // Status is an engineer's current availability.
@@ -48,29 +39,21 @@ type Status string
 
 const (
 	StatusAvailable Status = "AVAILABLE"
-	// StatusPending is an engineer who has just been assigned a case
-	// (Escalate, SetPresence's queue-drain, or Decline's reassignment) but
-	// has not yet clicked Accept -- their capacity is already reserved
-	// (current_case_id is set, exactly like BUSY) so they're skipped by
-	// every "find an available engineer" query, but the CSM portal's
-	// status bar shows this distinctly from Busy until Router.Accept
-	// confirms it.
+	// StatusPending is an engineer who's just been assigned a case but
+	// hasn't clicked Accept yet. Their capacity is already reserved, so
+	// they're skipped by every "find an available engineer" query, but the
+	// portal shows this separately from Busy until Accept confirms it.
 	StatusPending Status = "PENDING"
-	// StatusBusy is an engineer with an accepted, in-progress session --
-	// only ever reached via Router.Accept from StatusPending.
+	// StatusBusy is an engineer with an accepted, in-progress session.
 	StatusBusy    Status = "BUSY"
 	StatusOffline Status = "OFFLINE"
 )
 
-// CaseInfo is everything csm-portal/backend needs to reconstruct the
-// customer_escalation chatEvent it publishes to whichever engineer this
-// case ends up assigned to (see that backend's internal/handler/chat.go) --
-// carried through Escalate/queueing/Decline verbatim, this service never
-// interprets these fields itself. Persisted as a JSONB blob (see
-// migrations/000001_create_engineers.up.sql and
-// 000002_create_escalation_queue.up.sql, renamed to chat_queue by 000008) rather than normalized columns --
-// this service never queries by any field other than CaseID, and a blob
-// keeps it a one-file change if csm-portal/backend ever adds a field.
+// CaseInfo is everything csm-portal/backend needs to reconstruct the chat
+// event it publishes to whichever engineer a case ends up assigned to.
+// Carried through Escalate/queueing/Decline verbatim -- this service never
+// interprets these fields itself. Stored as a JSONB blob rather than
+// normalized columns since nothing here queries by any field but CaseID.
 type CaseInfo struct {
 	CaseID         string `json:"caseId"`
 	ConversationID string `json:"conversationId"`

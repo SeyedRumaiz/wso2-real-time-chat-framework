@@ -14,20 +14,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Chat Routing Service — a prototype standalone service that receives
-// webhook-style calls from csm-portal/backend and routes live-engineer-chat
-// escalations to available engineers. See internal/router.Router for the
-// full state machine (Available/Busy/Offline, single-dedicated-session
-// capacity, FIFO waiting queue) and csm-portal/backend's
-// internal/routingclient for the caller side.
+// Chat Routing Service receives webhook-style calls from csm-portal/backend
+// and routes live-engineer-chat escalations to available engineers.
 //
-// State (engineer presence + escalation queue) is persisted in this
-// service's own PostgreSQL database — see migrations/ and internal/db —
-// so, unlike the original in-memory prototype, restarting this process no
-// longer loses in-flight routing state, and a future multi-replica
-// deployment would share state correctly. Still single-process only for
-// now: no leader election or cross-replica coordination beyond what
-// Postgres's own row locking already gives each request.
+// Engineer presence and the escalation queue are persisted in Postgres, so
+// restarting the process doesn't lose in-flight routing state. Still
+// single-process only, no leader election across replicas.
 package main
 
 import (
@@ -50,13 +42,11 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/chat-routing-service/backend/internal/router"
 )
 
-// dbConnectTimeout bounds how long startup waits for the initial pool
-// connection + ping before giving up — a hung/unreachable database should
-// fail fast at startup, not hang the process indefinitely.
+// dbConnectTimeout bounds how long startup waits for the initial db
+// connection so an unreachable database fails fast instead of hanging.
 const dbConnectTimeout = 10 * time.Second
 
-// shutdownTimeout bounds graceful shutdown, mirroring entity-service's
-// cmd/api/main.go.
+// shutdownTimeout bounds graceful shutdown.
 const shutdownTimeout = 10 * time.Second
 
 func main() {
@@ -81,10 +71,8 @@ func main() {
 
 	r := router.NewRouter(pool)
 
-	// pendingTimeout: how long an engineer can sit PENDING (assigned a case,
-	// not yet accepted) before POST /route/sweep-timeouts reassigns or
-	// requeues that case and takes the unresponsive engineer OFFLINE -- see
-	// internal/router/timeout.go's SweepExpiredPending doc comment.
+	// how long an engineer can sit PENDING before sweep-timeouts reassigns
+	// the case and marks the engineer OFFLINE
 	pendingTimeout := envDurationSeconds("PENDING_TIMEOUT_SECONDS", 90)
 	h := handler.NewRoutingHandler(r, pendingTimeout)
 
@@ -95,17 +83,16 @@ func main() {
 	mux.HandleFunc("POST /route/decline", h.Decline)
 	mux.HandleFunc("POST /route/accept", h.Accept)
 	mux.HandleFunc("GET /route/presence/{userId}", h.GetPresence)
-	// Local stand-in persistence endpoints -- see internal/router/workitem.go.
+	// stand-in persistence endpoints until real persistence lands
 	mux.HandleFunc("POST /route/workitem", h.CreateWorkItem)
 	mux.HandleFunc("POST /route/comment", h.AddComment)
 	mux.HandleFunc("GET /route/debug/workitem/{caseId}", h.DebugWorkItem)
 	mux.HandleFunc("GET /route/debug/state", h.DebugState)
 	mux.HandleFunc("POST /route/sweep-timeouts", h.SweepTimeouts)
 
-	// /health is deliberately outside the InternalToken gate below (an
-	// explicit "GET /health" pattern on topMux takes priority over the
-	// catch-all "/" pattern per net/http's ServeMux matching rules) so a
-	// local liveness check doesn't need the shared secret.
+	// /health sits outside the InternalToken gate below -- ServeMux matches
+	// the exact "GET /health" pattern before falling through to "/", so
+	// liveness checks don't need the shared secret.
 	topMux := http.NewServeMux()
 	topMux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -157,10 +144,9 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-// envDurationSeconds returns the given environment variable (or defSeconds
-// if unset) as a time.Duration, interpreting the value as a plain whole
-// number of seconds (e.g. "90", not "90s"). Exits the process if set to
-// something else, matching mustPort's fail-fast-at-startup style below.
+// envDurationSeconds reads key as a plain whole number of seconds (e.g.
+// "90", not "90s"), or defSeconds if unset. Exits the process if the value
+// isn't a positive integer.
 func envDurationSeconds(key string, defSeconds int) time.Duration {
 	v := envOrDefault(key, strconv.Itoa(defSeconds))
 	secs, err := strconv.Atoi(v)
@@ -171,10 +157,9 @@ func envDurationSeconds(key string, defSeconds int) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// mustPort returns the value of the given environment variable (or def if
-// unset) as a bare port number, e.g. "9096" — not an address like ":9096".
-// Exits the process if the value isn't a valid TCP port, matching
-// csm-portal/backend's own mustPort helper.
+// mustPort returns the given environment variable (or def if unset) as a
+// bare port number, e.g. "9096", not an address like ":9096". Exits the
+// process if the value isn't a valid TCP port.
 func mustPort(key, def string) string {
 	v := envOrDefault(key, def)
 	port, err := strconv.Atoi(v)
@@ -186,10 +171,7 @@ func mustPort(key, def string) string {
 }
 
 // loadDotEnv reads a .env file and sets any unset environment variables
-// from it. Silently ignored if the file does not exist; logs a warning for
-// any other error. Copied from csm-portal/backend's cmd/server/main.go —
-// this service is small enough that sharing it via a common internal
-// package would be more indirection than the duplication it avoids.
+// from it. A missing file is fine; any other read error just gets logged.
 func loadDotEnv(path string) {
 	f, err := os.Open(path) // #nosec G304 -- path is always the hardcoded literal ".env" at the only call site
 	if err != nil {

@@ -14,26 +14,16 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Renames escalation_queue to chat_queue and drops order_key, per the
--- 2026-09-07 DB schema review (see the project's
--- db-schema-review-2026-09-07-outcomes.md doc): "escalation" collides with
--- terminology already used elsewhere, and queue order should be derived
--- from when a row was created rather than a maintained integer sequence.
+-- Renames escalation_queue to chat_queue and drops order_key: queue order
+-- is now derived from created_at instead of a maintained integer
+-- sequence.
 --
--- A pure created_at sort can't express "requeue at the FRONT" on its own,
--- though (Router.Decline / SweepExpiredPending push a declined/timed-out
--- case back ahead of everyone who has been waiting since before it was
--- ever assigned -- see those methods' own doc comments for why: that
--- customer already waited once). The meeting's own transcript raises
--- exactly this scenario without fully reconciling it against a pure
--- timestamp sort. Rather than reintroduce an order_key-shaped integer
--- sequence (the thing the derived-from-created_at conclusion was trying to
--- avoid), this adds one boolean, `requeued`: rows with requeued = true
--- always sort ahead of requeued = false rows, and *within* each of those
--- two groups, ordering is exactly the derived-from-created_at sort the
--- review concluded on. No table lock or MAX/MIN computation needed to
--- enqueue any more (see enqueueCase in internal/router/state.go) -- a nice
--- side effect of dropping order_key, not just parity with it.
+-- A pure created_at sort can't express "requeue at the front" (a declined
+-- or timed-out case needs to go back ahead of everyone still waiting,
+-- since that customer already waited once). Adding one boolean, requeued,
+-- handles it: requeued rows sort ahead of non-requeued ones, and within
+-- each group it's plain created_at order. Bonus: enqueueing no longer
+-- needs a table lock or MAX/MIN computation.
 ALTER TABLE chat_routing.escalation_queue RENAME TO chat_queue;
 
 DROP INDEX IF EXISTS chat_routing.idx_escalation_queue_order;
@@ -42,8 +32,6 @@ ALTER TABLE chat_routing.chat_queue
   DROP COLUMN order_key,
   ADD COLUMN requeued BOOLEAN NOT NULL DEFAULT FALSE;
 
--- Pop-the-head query: ORDER BY requeued DESC, created_at ASC, id ASC --
--- requeued rows first (oldest-requeued first among themselves), then
--- everyone else oldest-first; id still breaks ties between two rows
--- inserted in the same instant.
+-- Pop-the-head query: ORDER BY requeued DESC, created_at ASC, id ASC.
+-- id breaks ties between rows inserted in the same instant.
 CREATE INDEX idx_chat_queue_order ON chat_routing.chat_queue (requeued DESC, created_at ASC, id ASC);

@@ -14,23 +14,11 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Persistent audit trail of assignment outcomes, per the 2026-09-07 DB
--- schema review (see the project's db-schema-review-2026-09-07-outcomes.md
--- doc): "a persistent audit table ... conversation identifiers, engineer
--- identifiers, and statuses (such as connected, rejected, or timed out)
--- should be established for future reference."
---
--- This service never pings more than one candidate engineer at a time for
--- a given case (see Router.Escalate / popAvailableEngineer -- capacity is
--- reserved on the one engineer selected, not broadcast to several and
--- raced), so there is no live "pinged, awaiting response from N
--- candidates" state to persist here. One row is appended per assignment
--- once its outcome is known -- CONNECTED when Router.Accept succeeds,
--- REJECTED when Router.Decline succeeds (for the declining engineer),
--- TIMED_OUT when Router.SweepExpiredPending times an engineer out -- which
--- is exactly the "who was assigned what case and what happened" audit
--- trail the review asked for, without inventing multi-candidate ping state
--- this design doesn't otherwise have. Append-only, same style as
+-- Persistent audit trail of assignment outcomes: one row per assignment,
+-- appended once the outcome is known (CONNECTED on accept, REJECTED on
+-- decline, TIMED_OUT on timeout). This service only ever pings one
+-- candidate engineer per case at a time, so there's no multi-candidate
+-- "awaiting response" state to track here -- append-only, same style as
 -- assignment_log.
 CREATE TYPE chat_routing.assignment_outcome AS ENUM ('CONNECTED', 'REJECTED', 'TIMED_OUT');
 
@@ -42,10 +30,8 @@ CREATE TABLE chat_routing.chat_queue_engineer_assignment (
   occurred_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Backs "full outcome history for this case" and "history for this
--- engineer" lookups -- no live query in this service depends on this index
--- yet (see this file's own comment above: this table is audit-only), but
--- either access pattern is an obvious future need for this data.
+-- Backs outcome-history lookups by case and by engineer. No live query
+-- uses these yet, but both are an obvious future need for audit data.
 CREATE INDEX idx_chat_queue_engineer_assignment_case
   ON chat_routing.chat_queue_engineer_assignment (case_id, occurred_at);
 CREATE INDEX idx_chat_queue_engineer_assignment_engineer

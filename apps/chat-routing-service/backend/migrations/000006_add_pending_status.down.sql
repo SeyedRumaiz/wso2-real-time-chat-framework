@@ -14,11 +14,9 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Postgres has no DROP VALUE for enums -- the standard workaround is to
--- recreate the type without the value being removed. Any row currently
--- PENDING is mapped back to BUSY (what it would have been before this
--- migration existed) first, so downgrading never leaves a row pointing at
--- a value that's about to stop existing.
+-- Postgres can't drop an enum value, so we recreate the type without it.
+-- Rows currently PENDING map back to BUSY first so nothing is left
+-- pointing at a value that's about to disappear.
 UPDATE chat_routing.engineers SET status = 'BUSY' WHERE status = 'PENDING';
 
 ALTER TABLE chat_routing.engineers ALTER COLUMN status DROP DEFAULT;

@@ -14,9 +14,8 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Adds PENDING: an engineer a case is assigned to is now marked PENDING,
--- not BUSY, until they explicitly accept it. BUSY is now reserved for an
--- accepted, in-progress session. PENDING and BUSY both count as "has a
--- current case" everywhere that check already exists, so nothing else
--- here needs to change.
-ALTER TYPE chat_routing.engineer_status ADD VALUE 'PENDING';
+-- Recreates the column with its original default. Can't restore which rows
+-- would have had it set, since chat_status now carries that distinction --
+-- any row genuinely OFFLINE mid-session just reads pending_offline = false.
+ALTER TABLE chat_routing.cs_engineer_status
+  ADD COLUMN pending_offline BOOLEAN NOT NULL DEFAULT FALSE;

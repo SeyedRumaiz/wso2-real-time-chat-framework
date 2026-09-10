@@ -14,14 +14,13 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Reverts 000004: back to email as the primary key, engineer_id dropped.
--- Same ephemeral-state reasoning as the up migration -- rows are cleared
--- rather than the engineer_id column's values preserved anywhere.
+-- Back to email as the primary key, engineer_id dropped. Rows are cleared
+-- rather than preserving engineer_id's values anywhere, same as the up
+-- migration.
 TRUNCATE chat_routing.engineers CASCADE;
 
--- Same reasoning as the up migration, in reverse: the FK depends on the
--- engineers_email_key unique index being dropped below, so it has to be
--- dropped and re-attached (to the restored PK(email)) explicitly.
+-- FK depends on the engineers_email_key index being dropped below, so it
+-- has to be dropped and re-attached to the restored PK(email).
 ALTER TABLE chat_routing.customer_engineer_assignments
   DROP CONSTRAINT customer_engineer_assignments_engineer_email_fkey;
 

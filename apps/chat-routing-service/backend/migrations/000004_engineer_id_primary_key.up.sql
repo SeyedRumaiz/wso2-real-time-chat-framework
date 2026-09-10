@@ -14,31 +14,23 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Switches chat_routing.engineers' primary key from email to engineer_id --
--- the IdP's stable per-account "userid" claim (see csm-portal/backend's
--- internal/middleware.UserInfo.UserID, which decodes that same claim on
--- every authenticated request), not a locally-generated ID. email stays a
--- required, unique column: every route this service exposes still
--- identifies an engineer by email (GET /route/presence/{email}, the
--- escalate/completed/decline bodies) -- only POST /route/presence, the one
--- place a new row is created, also carries engineerId, since this service
--- has no way to mint that identifier itself.
+-- Switches engineers' primary key from email to engineer_id, the IdP's
+-- stable per-account userid claim, not a locally-generated ID. email stays
+-- required and unique since most routes still identify an engineer by
+-- email; only POST /route/presence (the one place a new row is created)
+-- also carries engineerId, since this service has no way to mint that ID
+-- itself.
 --
--- This is a pre-launch service whose presence rows are ephemeral working
--- state (an engineer just needs to set their status again after this
--- runs), so rather than a synthetic backfill for rows that predate
--- engineer_id, existing rows are simply cleared. CASCADE also clears
--- customer_engineer_assignments, whose FK points at email -- those sticky
--- assignments would otherwise dangle once the engineers they point to are
--- gone.
+-- Presence rows are ephemeral pre-launch state, so instead of backfilling
+-- engineer_id for existing rows, this just truncates. CASCADE also clears
+-- customer_engineer_assignments, whose FK points at email, so those rows
+-- don't dangle once the engineers they reference are gone.
 TRUNCATE chat_routing.engineers CASCADE;
 
--- customer_engineer_assignments' FK depends on the PK's backing index
--- specifically, not "any unique constraint on email" -- drop it before the
--- PK swap and re-attach it to the new UNIQUE(email) constraint below,
--- rather than CASCADE-dropping it silently along with the old PK. (Found
--- by actually running this migration -- CASCADE here would have silently
--- dropped a real FK constraint instead of just clearing rows.)
+-- The FK depends on the PK's backing index specifically, so it has to be
+-- dropped before the PK swap and re-attached to the new UNIQUE(email)
+-- constraint below -- otherwise dropping the old PK would silently
+-- cascade-drop the FK too.
 ALTER TABLE chat_routing.customer_engineer_assignments
   DROP CONSTRAINT customer_engineer_assignments_engineer_email_fkey;
 

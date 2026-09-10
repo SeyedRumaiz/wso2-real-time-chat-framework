@@ -125,11 +125,8 @@ func (h *RoutingHandler) Escalate(w http.ResponseWriter, r *http.Request) {
 }
 
 // presenceRequest is the body for POST /route/presence. UserID is the
-// IdP's stable per-account "userid" claim (see internal/router.Router.
-// SetPresence and migrations/000014_rename_engineer_status_table) -- this
-// service's cs_engineer_status table is keyed by it directly, so unlike
-// before that migration no separate identifier is needed to create a
-// first-contact row.
+// IdP's stable per-account "userid" claim -- cs_engineer_status is keyed
+// by it directly, so nothing else is needed to create a first-contact row.
 type presenceRequest struct {
 	UserID string `json:"userId"`
 	Status string `json:"status"`
@@ -264,10 +261,7 @@ func (h *RoutingHandler) GetPresence(w http.ResponseWriter, r *http.Request) {
 }
 
 // workItemRequest is the body for POST /route/workitem -- see
-// router.Router.CreateWorkItem. ConversationID used to be part of this
-// request (persisted into chat_conversation.conversation_id) -- dropped
-// along with that column, see migrations/000010_chat_conversation_state.up.sql's
-// own doc comment.
+// router.Router.CreateWorkItem.
 type workItemRequest struct {
 	CaseID         string `json:"caseId"`
 	CreatorEmail   string `json:"creatorEmail"`
@@ -353,12 +347,9 @@ func (h *RoutingHandler) DebugState(w http.ResponseWriter, r *http.Request) {
 }
 
 // SweepTimeouts handles POST /route/sweep-timeouts. Called periodically by
-// csm-portal/backend (see that service's ChatHandler.StartTimeoutSweeper)
-// rather than run as this process's own ticker, so the one component that
-// already owns the engineer SSE hub is also the one deciding when to look
-// and delivering whatever this returns -- see router.Router.
-// SweepExpiredPending's doc comment for the full reassign/requeue/OFFLINE
-// behavior this triggers for any engineer who's been PENDING too long.
+// csm-portal/backend rather than run as this process's own ticker, so the
+// component that owns the engineer SSE hub is also the one deciding when
+// to look and delivering whatever this returns.
 func (h *RoutingHandler) SweepTimeouts(w http.ResponseWriter, r *http.Request) {
 	results, err := h.router.SweepExpiredPending(r.Context(), h.pendingTimeout)
 	if err != nil {

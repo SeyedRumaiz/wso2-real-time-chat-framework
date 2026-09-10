@@ -14,10 +14,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Package db manages the PostgreSQL connection pool this service uses for
-// engineer presence, sticky routing, and the escalation queue -- ordinarily
-// the same physical database entity-service connects to, kept separate at
-// the schema level instead (see internal/config.Schema and migrations/).
+// Package db manages the PostgreSQL connection pool used for engineer
+// presence and the escalation queue.
 package db
 
 import (
@@ -32,22 +30,18 @@ import (
 )
 
 const (
-	poolMaxConns        int32         = 10               // this service's write volume is far lower than entity-service's
+	poolMaxConns        int32         = 10               // write volume here is low, no need for a big pool
 	poolMinConns        int32         = 1                // connections kept warm when idle
 	poolMaxConnLifetime time.Duration = 30 * time.Minute // rotate connections to avoid stale server-side state
 	poolMaxConnIdleTime time.Duration = 5 * time.Minute  // release unused connections back to the OS
 )
 
-// NewPool creates a pgxpool connection pool for the given DSN, pings the
-// database to confirm connectivity, and returns the pool ready for use.
-// The caller is responsible for calling pool.Close on shutdown. Mirrors
-// entity-service's internal/db.NewPool, with smaller pool bounds and one
-// addition: every new physical connection has its search_path set to
-// config.Schema (AfterConnect runs once per new connection, not once per
-// pool.Acquire, so this is cheap) -- verified directly against a real
-// Postgres 16 instance while building this, since a bare "search_path"
-// DSN query parameter is rejected outright by libpq/pgx's URI parser and
-// isn't a safe alternative.
+// NewPool creates a pgxpool pool for the given DSN, pings it to confirm
+// connectivity, and returns it ready for use. The caller must call
+// pool.Close on shutdown. Each new connection gets its search_path set to
+// config.Schema via AfterConnect (runs once per connection, not per
+// Acquire, so it's cheap) since a bare search_path DSN parameter is
+// rejected by pgx's URI parser.
 func NewPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {

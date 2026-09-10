@@ -504,7 +504,7 @@ func (h *ChatHandler) HandleAcceptSession(w http.ResponseWriter, r *http.Request
 	// escalation path is a Postgres case, so this call is expected to fail
 	// there. This is no longer the only record of who accepted, though:
 	// Router.Accept (just above) already durably set chat_conversation.
-	// engineer_id in the LOCAL STAND-IN tables in the same transaction as
+	// assignee_id in the LOCAL STAND-IN tables in the same transaction as
 	// the PENDING -> BUSY flip. This PatchCase attempt is kept anyway, on
 	// the chance entity-service ever adds a real assignee column — a
 	// failure here must not block accepting either way.

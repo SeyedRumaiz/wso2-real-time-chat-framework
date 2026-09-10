@@ -14,8 +14,8 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Recreated empty -- rows dropped by the up migration are not recoverable
--- (this table was never anything but a derived/dynamic ranking input).
+-- Recreated empty -- the dropped rows aren't recoverable; this table only
+-- ever held a derived ranking input anyway.
 CREATE TABLE chat_routing.assignment_log (
   id           BIGSERIAL PRIMARY KEY,
   email        TEXT NOT NULL REFERENCES chat_routing.engineers (email),

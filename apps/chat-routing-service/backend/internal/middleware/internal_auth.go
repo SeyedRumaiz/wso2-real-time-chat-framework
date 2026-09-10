@@ -23,12 +23,8 @@ import (
 )
 
 // InternalTokenHeader carries the shared secret csm-portal/backend
-// authenticates with when calling this service (see that backend's
-// internal/routingclient package). This service has no user-facing routes
-// at all — every route is server-to-server, gated by this single check —
-// so, unlike csm-portal/backend's own InternalToken (which coexists with a
-// separate user-JWT Auth middleware on other routes), there is no second
-// auth mechanism in this codebase to keep this one distinct from.
+// authenticates with when calling this service. Every route here is
+// server-to-server, gated by this single check.
 const InternalTokenHeader = "X-Routing-Service-Token"
 
 // authErrorBody is the JSON error payload for an auth failure.
@@ -36,12 +32,11 @@ type authErrorBody struct {
 	Message string `json:"message"`
 }
 
-// InternalToken returns HTTP middleware that requires InternalTokenHeader to
-// equal expected, using a constant-time comparison to avoid a timing side
-// channel. An empty expected value always rejects — this must never be read
-// as "no check configured"; the caller (main.go) exits at startup instead if
-// ROUTING_SERVICE_TOKEN is unset, so expected is never actually empty in
-// practice.
+// InternalToken returns middleware that requires InternalTokenHeader to
+// equal expected, using a constant-time comparison so the check doesn't
+// leak the token through timing. An empty expected always rejects rather
+// than disabling the check -- main.go exits at startup if the token env
+// var isn't set, so this shouldn't come up in practice.
 func InternalToken(expected string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

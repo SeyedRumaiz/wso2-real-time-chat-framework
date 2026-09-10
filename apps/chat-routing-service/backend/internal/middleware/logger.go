@@ -22,10 +22,8 @@ import (
 	"time"
 )
 
-// responseWriter wraps http.ResponseWriter to capture the status code
-// written by the downstream handler so it can be included in the access
-// log, mirroring the identical helper in csm-portal/backend and
-// customer-portal/backend-v2.
+// responseWriter wraps http.ResponseWriter to capture the status code so
+// it can be included in the access log.
 type responseWriter struct {
 	http.ResponseWriter
 	status int

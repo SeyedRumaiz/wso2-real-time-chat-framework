@@ -14,14 +14,10 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Replaces the stored, lazily-reset engineers.chats_today/chats_today_date
--- counter with a small append-only log queried dynamically instead -- see
--- internal/router/state.go's popAvailableEngineer, debugEngineers, and
--- debugAvailable (which now COUNT(*) over today's rows) and
--- assignCaseToEngineer (which now INSERTs here instead of bumping a
--- column). Trades an O(1) column read for an indexed COUNT(*) bounded to
--- one calendar day per engineer, and picks up a free audit trail -- who
--- was assigned what, and when -- the stored counter never had.
+-- Replaces the stored, lazily-reset chats_today/chats_today_date columns
+-- with an append-only log queried dynamically (COUNT(*) per engineer per
+-- day). Trades an O(1) column read for an indexed COUNT(*), but picks up a
+-- free audit trail of who was assigned what and when.
 CREATE TABLE chat_routing.assignment_log (
   id           BIGSERIAL PRIMARY KEY,
   email        TEXT NOT NULL REFERENCES chat_routing.engineers (email),
@@ -29,7 +25,7 @@ CREATE TABLE chat_routing.assignment_log (
   assigned_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Backs both the "today" COUNT(*) (email, assigned_at range scan) and any
+-- Backs the "today" COUNT(*) (email, assigned_at range scan) and any
 -- future "history for this engineer" lookup.
 CREATE INDEX idx_assignment_log_email_assigned_at
   ON chat_routing.assignment_log (email, assigned_at);

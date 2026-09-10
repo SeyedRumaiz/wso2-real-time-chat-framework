@@ -1,9 +1,9 @@
--- FIFO of not-yet-assigned escalations, oldest first -- populated when
--- Escalate finds no AVAILABLE engineer, drained as engineers free up (see
--- Router.SetPresence / Router.Completed). order_key is a plain sortable
--- integer rather than created_at/id, because Decline needs to re-queue a
--- case at the FRONT (that customer already waited once) -- something a
--- purely chronological key can't express without moving every existing row.
+-- FIFO of not-yet-assigned escalations, oldest first. Populated when
+-- Escalate finds no AVAILABLE engineer, drained as engineers free up.
+-- order_key is a plain sortable integer rather than created_at/id because
+-- Decline needs to re-queue a case at the front (that customer already
+-- waited once), which a purely chronological key can't express without
+-- moving every existing row.
 CREATE TABLE chat_routing.escalation_queue (
   id          BIGSERIAL PRIMARY KEY,
   order_key   BIGINT NOT NULL,
@@ -12,6 +12,6 @@ CREATE TABLE chat_routing.escalation_queue (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Pop-the-head query: ORDER BY order_key, id -- id breaks ties between rows
--- that were assigned the same order_key by two concurrent enqueues.
+-- Pop-the-head query: ORDER BY order_key, id. id breaks ties between rows
+-- assigned the same order_key by concurrent enqueues.
 CREATE INDEX idx_escalation_queue_order ON chat_routing.escalation_queue (order_key, id);

@@ -14,10 +14,9 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- ASSIGNED rows have no equivalent slot in the old shape (a popped row was
--- deleted outright, not tracked) and are dropped here -- same "ephemeral
--- working state, best-effort rollback" precedent used elsewhere in this
--- migration history (e.g. 000004's down migration).
+-- ASSIGNED rows have no equivalent in the old shape (a popped row was
+-- deleted outright, not tracked), so they're dropped here rather than
+-- carried over.
 CREATE TABLE chat_routing.chat_queue_old (
   id          BIGSERIAL PRIMARY KEY,
   requeued    BOOLEAN NOT NULL DEFAULT FALSE,

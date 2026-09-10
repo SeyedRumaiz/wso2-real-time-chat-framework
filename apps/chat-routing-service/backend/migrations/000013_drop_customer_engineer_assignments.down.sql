@@ -14,12 +14,10 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Restores customer_engineer_assignments exactly as 000003 created it. Rows
--- are not restorable (the table was dropped, not archived) -- same
--- "ephemeral working state" precedent as 000004's own down migration. By
--- the time this runs, 000014's down migration has already restored
--- chat_routing.engineers (with its email column) ahead of this one, since
--- down migrations run in reverse numeric order.
+-- Restores customer_engineer_assignments as 000003 created it. Rows aren't
+-- recoverable since the table was dropped, not archived. The FK below needs
+-- chat_routing.engineers.email, which 000014's down migration has already
+-- restored by the time this runs (down migrations run in reverse order).
 CREATE TABLE chat_routing.customer_engineer_assignments (
   customer_email  TEXT PRIMARY KEY,
   engineer_email  TEXT NOT NULL REFERENCES chat_routing.engineers (email),

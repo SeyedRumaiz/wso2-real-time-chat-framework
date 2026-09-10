@@ -14,39 +14,21 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- 2026-09-07 DB schema review (see the project's
--- db-schema-review-2026-09-07-outcomes.md doc and its own full transcript):
+-- Renames engineers to cs_engineer_status and drops its email column --
+-- engineer_id (added in 000004) becomes the sole identifier, renamed to
+-- user_id, since email already lives in the user table. status is renamed
+-- to chat_status since this table only ever tracked chat presence, not a
+-- general engineer status.
 --
---   - engineers.email is dropped -- "we don't need to store email here
---     because it's there in the user table. It is just the user ID."
---     engineers.engineer_id (the IdP's stable per-account "userid" claim --
---     see migrations/000004) becomes the table's sole identifier, renamed
---     to user_id -- "the engineer ID, we can just rename it like user ID."
---   - The table itself is renamed: "this is too very specific to chat
---     conversation like available, pending and all" / "CS engineer chat
---     status" (Mifraz Murthaja's suggested name, used here in its shorter
---     form to match this feature's other already-short table names).
---   - Its status column is renamed to chat_status for the same reason --
---     "maybe just rename this status to chat status."
---
--- Every caller in this codebase that used to identify an engineer by email
--- now uses this same user_id instead: chat-routing-service's Router methods
--- and HTTP routes, its SDK, and csm-portal/backend's chat handlers + SSE
--- hub keys (engineerHubKey) -- see internal/router/state.go and this
--- service's README for the full list. csm-portal/backend already had this
--- value on hand for every authenticated request (middleware.UserInfo.
--- UserID, decoded from that same "userid" JWT claim) -- no new plumbing was
--- needed there, only switching which field its calls into this service
--- pass.
+-- Every caller that used to identify an engineer by email now uses user_id
+-- instead: this service's Router methods/routes, its SDK, and csm-portal's
+-- chat handlers and SSE hub keys (engineerHubKey) -- see
+-- internal/router/state.go.
 --
 -- chat_queue_engineer_assignment's FK depends on the email-backed unique
--- constraint being dropped below (same reasoning as migrations/000004's own
--- up migration -- CASCADE here would silently drop a real FK constraint
--- instead of just restructuring the table it points at) -- dropped and
--- re-pointed at the new user_id PK explicitly, in the same migration as its
--- own case_id/engineer_email -> conversation_id/engineer_id rename (per the
--- outcomes doc's own wording for this audit table: "conversation
--- identifiers, engineer identifiers, and statuses").
+-- constraint being dropped below, so it's dropped and re-pointed at the new
+-- user_id PK explicitly here, alongside its own case_id/engineer_email ->
+-- conversation_id/engineer_id rename.
 ALTER TABLE chat_routing.chat_queue_engineer_assignment
   DROP CONSTRAINT chat_queue_engineer_assignment_engineer_email_fkey;
 

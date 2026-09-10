@@ -15,13 +15,8 @@
 // under the License.
 
 // Package config loads this service's PostgreSQL connection settings from
-// the environment. Field names and DSN construction otherwise mirror
-// entity-service's own internal/config for consistency, since DBConfig
-// typically points at that very same database (DB_HOST/DB_PORT/DB_NAME
-// matching entity-service's own values) -- this service's tables live in
-// their own Postgres schema (see Schema and migrations/) rather than a
-// separate database, so the two services' migration histories and table
-// namespaces never collide even though they now share one database.
+// the environment. This service usually shares a database with
+// entity-service, kept separate via its own schema (see Schema).
 package config
 
 import (
@@ -30,20 +25,13 @@ import (
 	"os"
 )
 
-// Schema is the Postgres schema this service's tables live in (see
-// migrations/, which schema-qualifies every CREATE). internal/db.NewPool
-// sets it as every new connection's search_path (via pgxpool's
-// AfterConnect, not a DSN parameter -- a bare "search_path" query
-// parameter is rejected by libpq/pgx's URI parser, and the documented
-// "options=-c ..." workaround needs char-for-char correct percent-encoding
-// that isn't worth the risk here) so every unqualified table name in
-// internal/router's queries (engineers, chat_queue, chat_conversation, ...)
-// resolves here automatically, without schema-qualifying each query by hand.
+// Schema is the Postgres schema this service's tables live in. NewPool
+// sets it as each connection's search_path via AfterConnect rather than a
+// DSN parameter, since pgx's URI parser rejects a bare "search_path" query
+// param. That lets queries use unqualified table names.
 const Schema = "chat_routing"
 
-// DBConfig holds the PostgreSQL connection settings this service uses --
-// ordinarily the same database entity-service connects to (see Schema
-// above for how the two stay out of each other's way there).
+// DBConfig holds the PostgreSQL connection settings this service uses.
 type DBConfig struct {
 	Host     string
 	Port     string
@@ -89,9 +77,8 @@ func (c DBConfig) Validate() error {
 	return nil
 }
 
-// DSN constructs a PostgreSQL connection string from c, mirroring
-// entity-service's internal/config.Config.DSN. Does not set search_path --
-// see internal/db.NewPool for how Schema is applied instead.
+// DSN constructs a PostgreSQL connection string from c. Doesn't set
+// search_path -- see NewPool for how Schema gets applied instead.
 func (c DBConfig) DSN() string {
 	u := &url.URL{
 		Scheme: "postgres",

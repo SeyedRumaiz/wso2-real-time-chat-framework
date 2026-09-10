@@ -20,18 +20,17 @@ CREATE TYPE chat_routing.engineer_status_old AS ENUM ('AVAILABLE', 'BUSY', 'OFFL
 
 ALTER TABLE chat_routing.engineers ALTER COLUMN status DROP DEFAULT;
 
--- Same issue as the up-migration, in reverse: chk_available_since_only_when_available
--- and idx_engineers_available_since both embed a 'AVAILABLE' literal compiled
--- against the current engineer_status type, and Postgres can't re-validate
--- either one against engineer_status_old as part of the ALTER COLUMN ...
--- TYPE below (compares the two enum types directly and fails with
--- "operator does not exist"). Dropped here, recreated below once the type
--- swap is complete.
+-- Same issue as the up migration, in reverse: chk_available_since_only_when_available
+-- and idx_engineers_available_since embed an 'AVAILABLE' literal compiled
+-- against the current engineer_status type, and the ALTER COLUMN ... TYPE
+-- below can't re-validate them against engineer_status_old (compares the
+-- two enum types directly and fails with "operator does not exist"). Drop
+-- both here, recreate them once the type swap is done.
 ALTER TABLE chat_routing.engineers DROP CONSTRAINT IF EXISTS chk_available_since_only_when_available;
 DROP INDEX IF EXISTS chat_routing.idx_engineers_available_since;
 
--- A row currently "derived pending" (BUSY with no accepted_at yet) goes
--- back to being stored as PENDING directly.
+-- A row currently "derived pending" (BUSY with no accepted_at) goes back
+-- to being stored as PENDING directly.
 ALTER TABLE chat_routing.engineers
   ALTER COLUMN status TYPE chat_routing.engineer_status_old
   USING (CASE

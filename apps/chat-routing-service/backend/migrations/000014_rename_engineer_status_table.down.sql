@@ -23,11 +23,9 @@ ALTER TABLE chat_routing.chat_queue_engineer_assignment RENAME COLUMN conversati
 ALTER TABLE chat_routing.cs_engineer_status RENAME COLUMN chat_status TO status;
 
 -- email's original values can't be restored (never stored anywhere once
--- dropped) -- same "ephemeral working state" precedent as migrations/
--- 000004's own down migration. Existing rows get a placeholder so the
--- restored NOT NULL/UNIQUE constraints are satisfiable; a real rollback of
--- this migration means every engineer must set their presence again anyway
--- to get a real email attached.
+-- dropped). Existing rows get a placeholder so the restored NOT
+-- NULL/UNIQUE constraints are satisfiable; a real rollback means every
+-- engineer needs to set their presence again to get a real email attached.
 ALTER TABLE chat_routing.cs_engineer_status ADD COLUMN email TEXT;
 UPDATE chat_routing.cs_engineer_status SET email = user_id || '@unknown.invalid';
 ALTER TABLE chat_routing.cs_engineer_status ALTER COLUMN email SET NOT NULL;

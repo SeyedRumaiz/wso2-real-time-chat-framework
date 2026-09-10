@@ -18,9 +18,7 @@ package middleware
 
 import "net/http"
 
-// SecurityHeaders sets security-related response headers on every response,
-// mirroring the equivalent middleware in csm-portal/backend and
-// customer-portal/backend-v2.
+// SecurityHeaders sets security-related response headers on every response.
 func SecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
