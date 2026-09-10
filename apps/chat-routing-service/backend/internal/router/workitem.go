@@ -30,6 +30,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -51,12 +52,15 @@ type WorkItem struct {
 type ChatConversation struct {
 	WorkItemID string `json:"workItemId"`
 	CaseID     string `json:"caseId"`
-	// AssigneeID is nil until Router.Accept confirms the engineer.
+	// AssigneeID is nil until this conversation is assigned to an engineer
+	// (see internal/router/state.go's assignCaseToEngineer) -- set at
+	// assignment time, not at Accept, so a pending-but-unconfirmed
+	// conversation is distinguishable from a still-queued one.
 	AssigneeID *string `json:"assigneeId,omitempty"`
-	// State is this conversation's lifecycle stage: OPEN until Accept moves
-	// it to ACTIVE (see setConversationAssignee). The database enum also
-	// has RESOLVED/CONVERTED_CHAT/CONVERTED_CASE/ABANDONED/CLOSED, but
-	// nothing sets those yet.
+	// State is this conversation's lifecycle stage: OPEN until Router.
+	// Accept moves it to ACTIVE. The database enum also has RESOLVED/
+	// CONVERTED_CHAT/CONVERTED_CASE/ABANDONED/CLOSED, but nothing sets
+	// those yet.
 	State string `json:"state"`
 }
 
@@ -77,54 +81,53 @@ type WorkItemDetail struct {
 }
 
 // CreateWorkItem creates the work_item + chat_conversation pair (starting
-// in state OPEN) for a brand-new escalation, plus its first comment if the
-// triggering message is non-empty. Called once per case regardless of
-// whether Escalate assigns or queues it -- routing outcome doesn't affect
-// whether the record exists. This is a create, not an upsert: calling it
-// twice for the same caseID is a caller bug this doesn't try to reconcile.
-func (r *Router) CreateWorkItem(ctx context.Context, caseID, creatorEmail, subject, initialMessage string) error {
+// in state OPEN, unassigned) for a brand-new escalation, plus its first
+// comment if c.Message is non-empty. Also stores c itself as
+// chat_conversation.case_info -- the durable display blob (subject,
+// customer email/name, message) GetPresence/DebugState read back for as
+// long as this conversation is held by an engineer, including after
+// Accept (unlike chat_queue's own case_info, which Accept deletes).
+//
+// Called once per case, BEFORE Router.Escalate -- unlike the single-case
+// model this replaced, Escalate's own assignment now writes
+// chat_conversation.assignee_id directly (see assignCaseToEngineer), so
+// this row must already exist by the time Escalate runs. This mirrors how
+// the real entity-service case this stand-in mimics already exists before
+// csm-portal/backend's HandleEscalate is even called. This is a create,
+// not an upsert: calling it twice for the same c.CaseID is a caller bug
+// this doesn't try to reconcile.
+func (r *Router) CreateWorkItem(ctx context.Context, c CaseInfo) error {
+	caseInfoJSON, err := json.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("marshal case info: %w", err)
+	}
+
 	return r.withTx(ctx, func(tx pgx.Tx) error {
 		var workItemID string
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO work_item (creator_id, subject) VALUES ($1, $2)
 			RETURNING id
-		`, creatorEmail, subject).Scan(&workItemID); err != nil {
+		`, c.CustomerEmail, c.Subject).Scan(&workItemID); err != nil {
 			return fmt.Errorf("insert work_item: %w", err)
 		}
 
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO chat_conversation (work_item_id, case_id)
-			VALUES ($1, $2)
-		`, workItemID, caseID); err != nil {
+			INSERT INTO chat_conversation (work_item_id, case_id, case_info)
+			VALUES ($1, $2, $3::jsonb)
+		`, workItemID, c.CaseID, caseInfoJSON); err != nil {
 			return fmt.Errorf("insert chat_conversation: %w", err)
 		}
 
-		if initialMessage != "" {
+		if c.Message != "" {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO comment (work_item_id, content, created_by)
 				VALUES ($1, $2, $3)
-			`, workItemID, initialMessage, creatorEmail); err != nil {
+			`, workItemID, c.Message, c.CustomerEmail); err != nil {
 				return fmt.Errorf("insert initial comment: %w", err)
 			}
 		}
 		return nil
 	})
-}
-
-// setConversationAssignee records which engineer accepted caseID's chat.
-// Called from Accept in the same transaction as the PENDING -> BUSY flip,
-// so the two can never disagree about whether an accept went through. A
-// no-op if caseID has no chat_conversation row -- Accept's own PENDING/
-// caseID check is the real authority on whether the accept is valid; this
-// just records the byproduct of a valid one.
-func setConversationAssignee(ctx context.Context, tx pgx.Tx, caseID, assigneeUserID string) error {
-	if _, err := tx.Exec(ctx, `
-		UPDATE chat_conversation SET assignee_id = $1, state = 'ACTIVE', updated_at = now()
-		WHERE case_id = $2
-	`, assigneeUserID, caseID); err != nil {
-		return fmt.Errorf("set conversation assignee: %w", err)
-	}
-	return nil
 }
 
 // AddComment appends one message to caseID's transcript, looking up its

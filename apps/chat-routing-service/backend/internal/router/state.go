@@ -81,14 +81,18 @@ type EscalateResult struct {
 	Position int `json:"position,omitempty"`
 }
 
-// Escalate assigns c to whichever AVAILABLE engineer has taken the fewest
-// chats today (ties broken by who's been AVAILABLE longest -- see
+// Escalate assigns c to whichever AVAILABLE engineer with spare concurrent-
+// chat capacity has taken the fewest chats today (ties broken by fewest
+// currently-active chats, then who's been AVAILABLE longest -- see
 // popAvailableEngineer), or appends it to the waiting queue if nobody
 // qualifies.
 //
 // A chat_queue row is created for c either way (ASSIGNED or
 // WAITING_FOR_ENGINEER) and lives until Router.Accept confirms the
-// engineer.
+// engineer. Requires c's chat_conversation row (see workitem.go's
+// CreateWorkItem) to already exist -- csm-portal/backend creates it before
+// calling this, so assignCaseToEngineer below has a row to record the
+// assignment on.
 func (r *Router) Escalate(ctx context.Context, c CaseInfo) (EscalateResult, error) {
 	caseInfoJSON, err := json.Marshal(c)
 	if err != nil {
@@ -113,7 +117,7 @@ func (r *Router) Escalate(ctx context.Context, c CaseInfo) (EscalateResult, erro
 		if _, err := insertQueueRow(ctx, tx, c, caseInfoJSON, queueAssigned); err != nil {
 			return err
 		}
-		if err := assignCaseToEngineer(ctx, tx, userID, c, caseInfoJSON); err != nil {
+		if err := assignCaseToEngineer(ctx, tx, userID, c); err != nil {
 			return err
 		}
 		result = EscalateResult{EngineerUserID: userID}
@@ -128,112 +132,86 @@ func (r *Router) Escalate(ctx context.Context, c CaseInfo) (EscalateResult, erro
 // PresenceResult is SetPresence's outcome.
 type PresenceResult struct {
 	Applied bool `json:"applied"`
-	// AssignedCase is set when this presence change immediately drained the
-	// queue (transitioning to AVAILABLE with a non-empty queue assigns the
-	// head to this same engineer).
-	AssignedCase *CaseInfo `json:"assignedCase,omitempty"`
+	// AssignedCases is set when this presence change immediately drained
+	// the queue -- transitioning to AVAILABLE claims cases off the queue
+	// until either it's empty or the engineer's own capacity is full, so
+	// (unlike Completed/Decline/a timeout, which each free at most one
+	// slot) more than one case can land here at once.
+	AssignedCases []CaseInfo `json:"assignedCases,omitempty"`
 }
 
-// SetPresence applies an engineer's requested status change, creating their
-// row (defaulting to OFFLINE) on first contact. userID is the IdP's stable
-// per-account "userid" claim -- cs_engineer_status is keyed by it directly,
-// so there's nothing else a caller needs to supply.
+// SetPresence applies an engineer's requested chat_status change, creating
+// their row (defaulting to OFFLINE, capacity 1) on first contact. userID is
+// the IdP's stable per-account "userid" claim -- cs_engineer_status is
+// keyed by it directly, so there's nothing else a caller needs to supply.
 //
-// Mid-session (current_case_id IS NOT NULL): requesting OFFLINE takes
-// effect immediately -- chat_status flips to OFFLINE right away, while
-// current_case_id/current_case/accepted_at are left untouched, so the
-// engineer keeps whatever they're already holding (PENDING or BUSY) until
-// it's resolved via Accept, Decline, Completed, or a timeout. Requesting
-// AVAILABLE or BUSY while mid-session undoes an earlier OFFLINE request by
-// flipping chat_status back to BUSY; a no-op if they were never OFFLINE.
-// Completed and Decline both check chat_status when the session actually
-// ends: OFFLINE means don't rejoin the pool or take a queued case, anything
-// else means return to AVAILABLE. Accept and the timeout sweep (see
-// isStuckPending, and SweepExpiredPending in timeout.go) both still treat
-// an OFFLINE engineer holding an unconfirmed case like a BUSY/unconfirmed
-// one, so a case never gets stranded just because the engineer asked to
-// leave before anyone confirmed it.
+// chat_status is a plain manual toggle, independent of how many cases the
+// engineer currently holds (see the package doc comment): AVAILABLE means
+// open to new work, BUSY is a do-not-disturb that takes none, OFFLINE is
+// gone. None of the three touch cases already assigned -- those are only
+// ever ended via Completed, handed off via Decline, or reassigned by a
+// timeout.
 //
-// Idle: AVAILABLE joins the pool and, if the queue is non-empty,
-// immediately claims and assigns the oldest waiting case (the engineer
-// goes straight to PENDING with it, not yet BUSY -- see Accept). OFFLINE
-// leaves/stays out of the pool. PENDING and BUSY aren't valid direct
-// requests -- both are states this method only ever produces as a side
-// effect -- so requesting either here is a no-op, same as any other
-// unrecognized status.
+// Requesting AVAILABLE additionally drains the waiting queue into this
+// engineer's own now-open capacity: it claims the oldest waiting case,
+// assigns it, and repeats until either the queue is empty or the engineer's
+// max_concurrent_chats is reached (see AssignedCases). BUSY and OFFLINE
+// never claim anything.
 func (r *Router) SetPresence(ctx context.Context, userID string, want Status) (PresenceResult, error) {
 	var result PresenceResult
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
-		row, err := ensureAndLockEngineer(ctx, tx, userID)
+		maxConcurrent, err := ensureAndLockEngineer(ctx, tx, userID)
 		if err != nil {
 			return err
-		}
-
-		if row.CurrentCaseID != nil {
-			if want == StatusOffline {
-				if row.ChatStatus != StatusOffline {
-					if _, err := tx.Exec(ctx, `
-						UPDATE cs_engineer_status SET chat_status = 'OFFLINE', updated_at = now()
-						WHERE user_id = $1
-					`, userID); err != nil {
-						return fmt.Errorf("set offline mid-session: %w", err)
-					}
-				}
-				result = PresenceResult{Applied: true}
-				return nil
-			}
-
-			// Anything else mid-session means "stay" -- undo an earlier
-			// OFFLINE request if one is in effect; otherwise this is a no-op
-			// (the session itself is never touched by a presence request).
-			if row.ChatStatus == StatusOffline {
-				if _, err := tx.Exec(ctx, `
-					UPDATE cs_engineer_status SET chat_status = 'BUSY', updated_at = now()
-					WHERE user_id = $1
-				`, userID); err != nil {
-					return fmt.Errorf("undo mid-session offline request: %w", err)
-				}
-			}
-			result = PresenceResult{Applied: true}
-			return nil
 		}
 
 		switch want {
 		case StatusAvailable:
 			if _, err := tx.Exec(ctx, `
 				UPDATE cs_engineer_status
-				SET chat_status = 'AVAILABLE',
-				    available_since = now(), updated_at = now()
+				SET chat_status = 'AVAILABLE', available_since = now(), updated_at = now()
 				WHERE user_id = $1
 			`, userID); err != nil {
 				return fmt.Errorf("set available: %w", err)
 			}
 
-			c, ok, err := claimOldestWaiting(ctx, tx)
+			activeCount, err := activeCaseCount(ctx, tx, userID)
 			if err != nil {
 				return err
 			}
-			if !ok {
-				result = PresenceResult{Applied: true}
-				return nil
+			var assigned []CaseInfo
+			for activeCount < maxConcurrent {
+				c, ok, err := claimOldestWaiting(ctx, tx)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					break
+				}
+				if err := assignCaseToEngineer(ctx, tx, userID, c); err != nil {
+					return err
+				}
+				assigned = append(assigned, c)
+				activeCount++
 			}
+			result = PresenceResult{Applied: true, AssignedCases: assigned}
+			return nil
 
-			caseInfoJSON, err := json.Marshal(c)
-			if err != nil {
-				return fmt.Errorf("marshal queued case: %w", err)
+		case StatusBusy:
+			if _, err := tx.Exec(ctx, `
+				UPDATE cs_engineer_status
+				SET chat_status = 'BUSY', available_since = NULL, updated_at = now()
+				WHERE user_id = $1
+			`, userID); err != nil {
+				return fmt.Errorf("set busy: %w", err)
 			}
-			if err := assignCaseToEngineer(ctx, tx, userID, c, caseInfoJSON); err != nil {
-				return err
-			}
-			assigned := c
-			result = PresenceResult{Applied: true, AssignedCase: &assigned}
+			result = PresenceResult{Applied: true}
 			return nil
 
 		case StatusOffline:
 			if _, err := tx.Exec(ctx, `
 				UPDATE cs_engineer_status
-				SET chat_status = 'OFFLINE',
-				    available_since = NULL, updated_at = now()
+				SET chat_status = 'OFFLINE', available_since = NULL, updated_at = now()
 				WHERE user_id = $1
 			`, userID); err != nil {
 				return fmt.Errorf("set offline: %w", err)
@@ -254,66 +232,70 @@ func (r *Router) SetPresence(ctx context.Context, userID string, want Status) (P
 
 // CompletedResult is Completed's outcome.
 type CompletedResult struct {
-	// Removed is true when the engineer had requested OFFLINE mid-session --
-	// they're not rejoining the pool or getting a queued case.
-	Removed bool `json:"removed,omitempty"`
-	// Rejoined is true when the engineer went back to AVAILABLE, possibly
-	// immediately BUSY again if AssignedCase is also set.
-	Rejoined     bool      `json:"rejoined,omitempty"`
+	// Ended is true when caseID was actually an open (not already-ended)
+	// conversation assigned to userID -- false is a no-op, guarding against
+	// a duplicate call for a session that already ended (a UI can fire this
+	// twice for the same case).
+	Ended bool `json:"ended,omitempty"`
+	// AssignedCase is set when ending this conversation freed a slot that
+	// was immediately backfilled from the waiting queue.
 	AssignedCase *CaseInfo `json:"assignedCase,omitempty"`
 }
 
-// Completed clears the engineer's current case and either removes them
-// entirely (if chat_status is already OFFLINE) or returns them to
-// AVAILABLE, immediately assigning the next queued case if there is one. A
-// no-op if userID has no row, or has no current_case_id right now -- the
-// latter guards against a duplicate call for a session that already ended
-// (a UI can fire this twice for the same case). Without that guard, a
-// second call would re-derive AVAILABLE-vs-OFFLINE from chat_status after
-// the first call had already reset it, silently flipping a correct OFFLINE
-// result back to AVAILABLE.
-func (r *Router) Completed(ctx context.Context, userID string) (CompletedResult, error) {
+// Completed ends userID's session on caseID: marks that specific
+// chat_conversation row's session_ended_at, then -- if the engineer is
+// still chat_status AVAILABLE and now has spare capacity -- claims the next
+// queued case for them, the same way SetPresence's own queue-drain does.
+// Unlike SetPresence, at most one slot is being freed here, so at most one
+// case is claimed. A no-op if caseID isn't currently an open conversation
+// assigned to userID.
+//
+// Deliberately never touches chat_status itself -- that's purely a manual
+// toggle now (see SetPresence's doc comment), so ending one of an
+// engineer's several concurrent sessions has no reason to change it.
+func (r *Router) Completed(ctx context.Context, userID, caseID string) (CompletedResult, error) {
 	var result CompletedResult
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE chat_conversation
+			SET session_ended_at = now(), updated_at = now()
+			WHERE case_id = $1 AND assignee_id = $2 AND session_ended_at IS NULL
+		`, caseID, userID)
+		if err != nil {
+			return fmt.Errorf("end session: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			result = CompletedResult{}
+			return nil
+		}
+		result = CompletedResult{Ended: true}
+
 		var (
 			chatStatus    Status
-			currentCaseID *string
+			maxConcurrent int
 		)
-		err := tx.QueryRow(ctx, `
-			SELECT chat_status, current_case_id FROM cs_engineer_status WHERE user_id = $1 FOR UPDATE
-		`, userID).Scan(&chatStatus, &currentCaseID)
+		err = tx.QueryRow(ctx, `
+			SELECT chat_status, max_concurrent_chats FROM cs_engineer_status WHERE user_id = $1 FOR UPDATE
+		`, userID).Scan(&chatStatus, &maxConcurrent)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
-			result = CompletedResult{}
+			// No engineer row is unexpected (Completed only applies to a
+			// case that WAS assigned to this engineer), but not a reason to
+			// fail this call -- the session end above already succeeded.
 			return nil
 		case err != nil:
 			return fmt.Errorf("lock engineer: %w", err)
 		}
-		if currentCaseID == nil {
-			result = CompletedResult{}
+		if chatStatus != StatusAvailable {
 			return nil
 		}
 
-		if chatStatus == StatusOffline {
-			if _, err := tx.Exec(ctx, `
-				UPDATE cs_engineer_status
-				SET accepted_at = NULL, current_case_id = NULL, current_case = NULL,
-				    available_since = NULL, updated_at = now()
-				WHERE user_id = $1
-			`, userID); err != nil {
-				return fmt.Errorf("clear session (removed): %w", err)
-			}
-			result = CompletedResult{Removed: true}
-			return nil
+		activeCount, err := activeCaseCount(ctx, tx, userID)
+		if err != nil {
+			return err
 		}
-
-		if _, err := tx.Exec(ctx, `
-			UPDATE cs_engineer_status
-			SET chat_status = 'AVAILABLE', accepted_at = NULL, current_case_id = NULL, current_case = NULL,
-			    available_since = now(), updated_at = now()
-			WHERE user_id = $1
-		`, userID); err != nil {
-			return fmt.Errorf("clear session (rejoin): %w", err)
+		if activeCount >= maxConcurrent {
+			return nil
 		}
 
 		c, ok, err := claimOldestWaiting(ctx, tx)
@@ -321,19 +303,13 @@ func (r *Router) Completed(ctx context.Context, userID string) (CompletedResult,
 			return err
 		}
 		if !ok {
-			result = CompletedResult{Rejoined: true}
 			return nil
 		}
-
-		caseInfoJSON, err := json.Marshal(c)
-		if err != nil {
-			return fmt.Errorf("marshal queued case: %w", err)
-		}
-		if err := assignCaseToEngineer(ctx, tx, userID, c, caseInfoJSON); err != nil {
+		if err := assignCaseToEngineer(ctx, tx, userID, c); err != nil {
 			return err
 		}
 		assigned := c
-		result = CompletedResult{Rejoined: true, AssignedCase: &assigned}
+		result.AssignedCase = &assigned
 		return nil
 	})
 	if err != nil {
@@ -357,60 +333,32 @@ type DeclineResult struct {
 }
 
 // Decline handles an engineer dismissing a case they were just assigned,
-// before accepting it. Treats it like Completed for the declining engineer,
-// then tries to hand caseID to whichever other AVAILABLE engineer has
-// handled the fewest chats today (same ranking Escalate uses, excluding the
-// decliner); if none are free, flips the case's chat_queue row back to
-// WAITING_FOR_ENGINEER, keeping its original queue position rather than
-// sending the customer to the back of the line a second time. A no-op if
-// userID has no row, or isn't currently holding caseID.
+// before accepting it. Reassigns caseID to whichever other AVAILABLE
+// engineer with spare capacity has handled the fewest chats today (same
+// ranking Escalate uses, excluding the decliner); if none are free, flips
+// the case's chat_queue row back to WAITING_FOR_ENGINEER, keeping its
+// original queue position rather than sending the customer to the back of
+// the line a second time. A no-op if caseID isn't currently an
+// unconfirmed conversation assigned to userID -- declining doesn't affect
+// any of userID's other concurrent cases.
 func (r *Router) Decline(ctx context.Context, userID, caseID string) (DeclineResult, error) {
 	var result DeclineResult
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
-		var (
-			currentCaseID *string
-			currentCase   []byte
-			chatStatus    Status
-		)
-		err := tx.QueryRow(ctx, `
-			SELECT current_case_id, current_case, chat_status
-			FROM cs_engineer_status WHERE user_id = $1 FOR UPDATE
-		`, userID).Scan(&currentCaseID, &currentCase, &chatStatus)
-		switch {
-		case errors.Is(err, pgx.ErrNoRows):
-			result = DeclineResult{}
-			return nil
-		case err != nil:
-			return fmt.Errorf("lock engineer: %w", err)
+		conv, ok, err := lockPendingConversation(ctx, tx, caseID, userID)
+		if err != nil {
+			return err
 		}
-		if currentCaseID == nil || *currentCaseID != caseID {
+		if !ok {
 			result = DeclineResult{}
 			return nil
 		}
 
-		var declined CaseInfo
-		if err := json.Unmarshal(currentCase, &declined); err != nil {
-			return fmt.Errorf("decode current case: %w", err)
-		}
-
-		if chatStatus == StatusOffline {
-			if _, err := tx.Exec(ctx, `
-				UPDATE cs_engineer_status
-				SET accepted_at = NULL, current_case_id = NULL, current_case = NULL,
-				    available_since = NULL, updated_at = now()
-				WHERE user_id = $1
-			`, userID); err != nil {
-				return fmt.Errorf("clear declined session (offline): %w", err)
-			}
-		} else {
-			if _, err := tx.Exec(ctx, `
-				UPDATE cs_engineer_status
-				SET chat_status = 'AVAILABLE', accepted_at = NULL, current_case_id = NULL, current_case = NULL,
-				    available_since = now(), updated_at = now()
-				WHERE user_id = $1
-			`, userID); err != nil {
-				return fmt.Errorf("clear declined session (available): %w", err)
-			}
+		if _, err := tx.Exec(ctx, `
+			UPDATE chat_conversation
+			SET assignee_id = NULL, accepted_at = NULL, updated_at = now()
+			WHERE case_id = $1
+		`, caseID); err != nil {
+			return fmt.Errorf("clear declined conversation: %w", err)
 		}
 
 		// Audit trail: userID's ping on this conversation is settled as
@@ -418,13 +366,8 @@ func (r *Router) Decline(ctx context.Context, userID, caseID string) (DeclineRes
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO chat_queue_engineer_assignment (conversation_id, engineer_id, status)
 			VALUES ($1, $2, 'REJECTED')
-		`, declined.ConversationID, userID); err != nil {
+		`, conv.ConversationID, userID); err != nil {
 			return fmt.Errorf("record decline outcome: %w", err)
-		}
-
-		declinedJSON, err := json.Marshal(declined)
-		if err != nil {
-			return fmt.Errorf("marshal declined case: %w", err)
 		}
 
 		candidate, ok, err := popAvailableEngineer(ctx, tx, userID)
@@ -432,15 +375,15 @@ func (r *Router) Decline(ctx context.Context, userID, caseID string) (DeclineRes
 			return err
 		}
 		if ok {
-			if err := assignCaseToEngineer(ctx, tx, candidate, declined, declinedJSON); err != nil {
+			if err := assignCaseToEngineer(ctx, tx, candidate, conv); err != nil {
 				return err
 			}
-			assigned := declined
+			assigned := conv
 			result = DeclineResult{ReassignedTo: candidate, AssignedCase: &assigned}
 			return nil
 		}
 
-		if err := requeueWaiting(ctx, tx, declined.ConversationID); err != nil {
+		if err := requeueWaiting(ctx, tx, conv.ConversationID); err != nil {
 			return err
 		}
 		result = DeclineResult{Requeued: true}
@@ -462,57 +405,35 @@ type AcceptResult struct {
 	Applied bool `json:"applied"`
 }
 
-// Accept confirms userID is actually accepting the case they were
-// assigned: sets accepted_at when their current_case_id still equals
-// caseID and nobody's confirmed it yet (see isStuckPending). Deliberately
-// not gated on chat_status being exactly BUSY -- an engineer who requested
-// OFFLINE mid-session before confirming this case can still accept it,
-// and doing so leaves chat_status exactly as it already is (BUSY or
-// OFFLINE) instead of forcing it back to BUSY, so their stated intent to
-// leave survives the accept and is honored once the session ends (see
-// Completed). Any other state reports Applied: false rather than erroring
-// -- "the thing you tried to accept isn't there anymore" is an expected
-// race, not a server fault.
+// Accept confirms userID is actually accepting caseID: sets that specific
+// chat_conversation row's accepted_at/state when it's still assigned to
+// userID and unconfirmed. Only that one case is affected -- any other
+// concurrent case userID holds is untouched either way. Any other state
+// reports Applied: false rather than erroring -- "the thing you tried to
+// accept isn't there anymore" is an expected race, not a server fault.
 //
 // Also deletes the case's chat_queue row -- a row lives from Escalate
 // until exactly this moment, not until mere assignment.
 func (r *Router) Accept(ctx context.Context, userID, caseID string) (AcceptResult, error) {
 	var result AcceptResult
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
-		var (
-			status        Status
-			currentCaseID *string
-			currentCase   []byte
-			acceptedAt    *time.Time
-		)
-		err := tx.QueryRow(ctx, `
-			SELECT chat_status, current_case_id, current_case, accepted_at
-			FROM cs_engineer_status WHERE user_id = $1 FOR UPDATE
-		`, userID).Scan(&status, &currentCaseID, &currentCase, &acceptedAt)
-		switch {
-		case errors.Is(err, pgx.ErrNoRows):
+		conv, ok, err := lockPendingConversation(ctx, tx, caseID, userID)
+		if err != nil {
+			return err
+		}
+		if !ok {
 			result = AcceptResult{}
 			return nil
-		case err != nil:
-			return fmt.Errorf("lock engineer: %w", err)
-		}
-		if !isStuckPending(status, currentCaseID != nil, acceptedAt) || currentCaseID == nil || *currentCaseID != caseID {
-			result = AcceptResult{}
-			return nil
-		}
-
-		var accepted CaseInfo
-		if err := json.Unmarshal(currentCase, &accepted); err != nil {
-			return fmt.Errorf("decode current case: %w", err)
 		}
 
 		if _, err := tx.Exec(ctx, `
-			UPDATE cs_engineer_status SET accepted_at = now(), updated_at = now() WHERE user_id = $1
-		`, userID); err != nil {
+			UPDATE chat_conversation SET state = 'ACTIVE', accepted_at = now(), updated_at = now()
+			WHERE case_id = $1
+		`, caseID); err != nil {
 			return fmt.Errorf("accept case: %w", err)
 		}
 
-		if err := deleteQueueRow(ctx, tx, accepted.ConversationID); err != nil {
+		if err := deleteQueueRow(ctx, tx, conv.ConversationID); err != nil {
 			return err
 		}
 
@@ -521,23 +442,10 @@ func (r *Router) Accept(ctx context.Context, userID, caseID string) (AcceptResul
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO chat_queue_engineer_assignment (conversation_id, engineer_id, status)
 			VALUES ($1, $2, 'CONNECTED')
-		`, accepted.ConversationID, userID); err != nil {
+		`, conv.ConversationID, userID); err != nil {
 			return fmt.Errorf("record accept outcome: %w", err)
 		}
 
-		// Local stand-in persistence (see workitem.go) -- records the
-		// accepting engineer on chat_conversation in the SAME transaction
-		// as the PENDING -> BUSY flip, so the two can never disagree about
-		// whether an accept actually went through. A caseID with no
-		// chat_conversation row (this stand-in added after some in-flight
-		// cases already existed, or CreateWorkItem's own best-effort call
-		// having failed) is a plain UPDATE-matches-zero-rows no-op here,
-		// not an error -- the real presence flip above must not fail
-		// because of a stand-in bookkeeping gap. setConversationAssignee
-		// only returns an error for an actual database failure.
-		if err := setConversationAssignee(ctx, tx, caseID, userID); err != nil {
-			return err
-		}
 		result = AcceptResult{Applied: true}
 		return nil
 	})
@@ -547,60 +455,102 @@ func (r *Router) Accept(ctx context.Context, userID, caseID string) (AcceptResul
 	return result, nil
 }
 
-// PresenceDetail is GetPresence's result. CurrentCase lets a caller
-// rehydrate a lost pending alert or active session (a refresh, a closed
-// tab) instead of leaving the engineer stuck with nothing to act on.
+// PresenceDetail is GetPresence's result: the engineer's manual chat_status,
+// their concurrent-chat capacity and current load, and every case they're
+// currently holding (pending or accepted alike) so a caller whose own UI
+// state was lost -- a refresh, a closed tab -- can rehydrate all of it
+// instead of leaving the engineer stuck with nothing to act on.
 type PresenceDetail struct {
-	Status      Status
-	CurrentCase *CaseInfo
-	// PendingSince is when this engineer entered PENDING (nil unless Status
-	// is PENDING), so a caller can compute how much longer until the
-	// timeout sweep reassigns this case even after losing local timer
-	// state. Not set for an engineer who requested OFFLINE before
-	// confirming their case -- their Status reads OFFLINE, not PENDING,
-	// even though the timeout sweep is still tracking them underneath.
-	PendingSince *time.Time
+	ChatStatus         Status       `json:"chatStatus"`
+	ActiveChats        int          `json:"activeChats"`
+	MaxConcurrentChats int          `json:"maxConcurrentChats"`
+	AtCapacity         bool         `json:"atCapacity"`
+	Cases              []CaseStatus `json:"cases,omitempty"`
 }
 
-// GetPresence returns userID's current status and, when PENDING or BUSY,
-// the case they are currently on (nil otherwise) -- defaulting to
-// OFFLINE/no case for an engineer this database has never seen a presence
-// update from.
+// GetPresence returns userID's current chat_status, capacity, and every
+// case they're currently holding -- defaulting to OFFLINE/capacity 1/no
+// cases for an engineer this database has never seen a presence update
+// from.
 func (r *Router) GetPresence(ctx context.Context, userID string) (PresenceDetail, error) {
 	var (
-		status      Status
-		currentCase []byte
-		updatedAt   time.Time
-		acceptedAt  *time.Time
+		chatStatus    Status
+		maxConcurrent int
 	)
-	err := r.db.QueryRow(ctx, `SELECT chat_status, current_case, updated_at, accepted_at FROM cs_engineer_status WHERE user_id = $1`, userID).
-		Scan(&status, &currentCase, &updatedAt, &acceptedAt)
+	err := r.db.QueryRow(ctx, `
+		SELECT chat_status, max_concurrent_chats FROM cs_engineer_status WHERE user_id = $1
+	`, userID).Scan(&chatStatus, &maxConcurrent)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		return PresenceDetail{Status: StatusOffline}, nil
+		return PresenceDetail{ChatStatus: StatusOffline, MaxConcurrentChats: 1}, nil
 	case err != nil:
 		return PresenceDetail{}, fmt.Errorf("router: get presence: %w", err)
 	}
-	detail := PresenceDetail{Status: externalStatus(status, currentCase != nil, acceptedAt)}
-	if isPendingAccept(status, currentCase != nil, acceptedAt) {
-		since := updatedAt
-		detail.PendingSince = &since
+
+	cases, err := engineerCases(ctx, r.db, userID)
+	if err != nil {
+		return PresenceDetail{}, fmt.Errorf("router: get presence: %w", err)
 	}
-	if currentCase != nil {
-		var c CaseInfo
-		if err := json.Unmarshal(currentCase, &c); err != nil {
-			return PresenceDetail{}, fmt.Errorf("router: get presence: decode current case: %w", err)
+	return PresenceDetail{
+		ChatStatus: chatStatus, ActiveChats: len(cases), MaxConcurrentChats: maxConcurrent,
+		AtCapacity: len(cases) >= maxConcurrent, Cases: cases,
+	}, nil
+}
+
+// pgxQuerier is the subset of *pgxpool.Pool that engineerCases needs --
+// satisfied directly by *pgxpool.Pool, declared here just to name the
+// dependency.
+type pgxQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// engineerCases returns every case currently held by userID (state OPEN or
+// ACTIVE, session not yet ended), oldest-assigned first. Shared by
+// GetPresence and debugEngineers.
+func engineerCases(ctx context.Context, q pgxQuerier, userID string) ([]CaseStatus, error) {
+	rows, err := q.Query(ctx, `
+		SELECT case_info, state, accepted_at, updated_at
+		FROM chat_conversation
+		WHERE assignee_id = $1 AND state IN ('OPEN', 'ACTIVE') AND session_ended_at IS NULL
+		ORDER BY updated_at ASC
+	`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("query cases: %w", err)
+	}
+	defer rows.Close()
+
+	var cases []CaseStatus
+	for rows.Next() {
+		var (
+			caseInfoJSON []byte
+			state        string
+			acceptedAt   *time.Time
+			updatedAt    time.Time
+		)
+		if err := rows.Scan(&caseInfoJSON, &state, &acceptedAt, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scan case: %w", err)
 		}
-		detail.CurrentCase = &c
+		var c CaseInfo
+		if caseInfoJSON != nil {
+			if err := json.Unmarshal(caseInfoJSON, &c); err != nil {
+				return nil, fmt.Errorf("decode case info: %w", err)
+			}
+		}
+		cases = append(cases, CaseStatus{
+			CaseInfo:   c,
+			Pending:    isPending(state, acceptedAt),
+			AssignedAt: updatedAt.Format(time.RFC3339),
+		})
 	}
-	return detail, nil
+	return cases, rows.Err()
 }
 
 // DebugEngineer is one engineer's row in DebugState's dump.
 type DebugEngineer struct {
-	UserID      string    `json:"userId"`
-	Status      Status    `json:"status"`
-	CurrentCase *CaseInfo `json:"currentCase,omitempty"`
+	UserID             string       `json:"userId"`
+	ChatStatus         Status       `json:"chatStatus"`
+	MaxConcurrentChats int          `json:"maxConcurrentChats"`
+	Cases              []CaseStatus `json:"cases,omitempty"`
 	// ChatsToday is a live COUNT(*) over chat_conversation for today,
 	// computed fresh on every call rather than read from a stored column.
 	ChatsToday int `json:"chatsToday"`
@@ -638,7 +588,7 @@ func (r *Router) DebugState(ctx context.Context) (DebugState, error) {
 
 func (r *Router) debugEngineers(ctx context.Context) ([]DebugEngineer, error) {
 	rows, err := r.db.Query(ctx, `
-		SELECT e.user_id, e.chat_status, e.current_case, e.accepted_at,
+		SELECT e.user_id, e.chat_status, e.max_concurrent_chats,
 		       COALESCE(t.today_count, 0)
 		FROM cs_engineer_status e
 		LEFT JOIN (
@@ -653,34 +603,40 @@ func (r *Router) debugEngineers(ctx context.Context) ([]DebugEngineer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("debug state: query engineers: %w", err)
 	}
-	defer rows.Close()
 
-	engineers := []DebugEngineer{}
+	type row struct {
+		userID        string
+		chatStatus    Status
+		maxConcurrent int
+		chatsToday    int
+	}
+	var raw []row
 	for rows.Next() {
-		var (
-			userID      string
-			status      Status
-			currentCase []byte
-			acceptedAt  *time.Time
-			chatsToday  int
-		)
-		if err := rows.Scan(&userID, &status, &currentCase, &acceptedAt, &chatsToday); err != nil {
+		var rr row
+		if err := rows.Scan(&rr.userID, &rr.chatStatus, &rr.maxConcurrent, &rr.chatsToday); err != nil {
+			rows.Close()
 			return nil, fmt.Errorf("debug state: scan engineer: %w", err)
 		}
-		var cc *CaseInfo
-		if currentCase != nil {
-			var c CaseInfo
-			if err := json.Unmarshal(currentCase, &c); err != nil {
-				return nil, fmt.Errorf("debug state: decode current case: %w", err)
-			}
-			cc = &c
+		raw = append(raw, rr)
+	}
+	rerr := rows.Err()
+	rows.Close()
+	if rerr != nil {
+		return nil, fmt.Errorf("debug state: query engineers: %w", rerr)
+	}
+
+	engineers := []DebugEngineer{}
+	for _, rr := range raw {
+		cases, err := engineerCases(ctx, r.db, rr.userID)
+		if err != nil {
+			return nil, fmt.Errorf("debug state: %w", err)
 		}
 		engineers = append(engineers, DebugEngineer{
-			UserID: userID, Status: externalStatus(status, currentCase != nil, acceptedAt), CurrentCase: cc,
-			ChatsToday: chatsToday,
+			UserID: rr.userID, ChatStatus: rr.chatStatus, MaxConcurrentChats: rr.maxConcurrent,
+			Cases: cases, ChatsToday: rr.chatsToday,
 		})
 	}
-	return engineers, rows.Err()
+	return engineers, nil
 }
 
 func (r *Router) debugAvailable(ctx context.Context) ([]string, error) {
@@ -688,14 +644,13 @@ func (r *Router) debugAvailable(ctx context.Context) ([]string, error) {
 		SELECT e.user_id
 		FROM cs_engineer_status e
 		LEFT JOIN (
-			SELECT assignee_id AS user_id, COUNT(*) AS today_count
+			SELECT assignee_id AS user_id, COUNT(*) AS active_count
 			FROM chat_conversation
-			WHERE assignee_id IS NOT NULL
-			  AND updated_at >= CURRENT_DATE AND updated_at < CURRENT_DATE + 1
+			WHERE assignee_id IS NOT NULL AND state IN ('OPEN', 'ACTIVE') AND session_ended_at IS NULL
 			GROUP BY assignee_id
 		) t ON t.user_id = e.user_id
-		WHERE e.chat_status = 'AVAILABLE' AND e.current_case_id IS NULL
-		ORDER BY COALESCE(t.today_count, 0) ASC, e.available_since ASC
+		WHERE e.chat_status = 'AVAILABLE' AND COALESCE(t.active_count, 0) < e.max_concurrent_chats
+		ORDER BY COALESCE(t.active_count, 0) ASC, e.available_since ASC
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("debug state: query available: %w", err)
@@ -739,55 +694,116 @@ func (r *Router) debugQueue(ctx context.Context) ([]CaseInfo, error) {
 	return queue, rows.Err()
 }
 
-// engineerRow is the subset of a cs_engineer_status row SetPresence needs,
-// locked FOR UPDATE for the rest of its transaction.
-type engineerRow struct {
-	ChatStatus    Status
-	CurrentCaseID *string
-}
-
 // ensureAndLockEngineer makes sure userID has a row (defaulting to
-// OFFLINE), then locks and returns it FOR UPDATE for the rest of tx.
-func ensureAndLockEngineer(ctx context.Context, tx pgx.Tx, userID string) (engineerRow, error) {
+// OFFLINE, capacity 1), then locks it FOR UPDATE for the rest of tx and
+// returns its configured max_concurrent_chats.
+func ensureAndLockEngineer(ctx context.Context, tx pgx.Tx, userID string) (maxConcurrent int, err error) {
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO cs_engineer_status (user_id) VALUES ($1)
 		ON CONFLICT (user_id) DO NOTHING
 	`, userID); err != nil {
-		return engineerRow{}, fmt.Errorf("ensure engineer row: %w", err)
+		return 0, fmt.Errorf("ensure engineer row: %w", err)
 	}
 
-	var row engineerRow
 	if err := tx.QueryRow(ctx, `
-		SELECT chat_status, current_case_id FROM cs_engineer_status WHERE user_id = $1 FOR UPDATE
-	`, userID).Scan(&row.ChatStatus, &row.CurrentCaseID); err != nil {
-		return engineerRow{}, fmt.Errorf("lock engineer row: %w", err)
+		SELECT max_concurrent_chats FROM cs_engineer_status WHERE user_id = $1 FOR UPDATE
+	`, userID).Scan(&maxConcurrent); err != nil {
+		return 0, fmt.Errorf("lock engineer row: %w", err)
 	}
-	return row, nil
+	return maxConcurrent, nil
 }
 
-// popAvailableEngineer locks and returns an AVAILABLE, idle engineer other
-// than exclude (pass "" to exclude no one): whichever has taken the fewest
-// chats today, ties broken by who's been AVAILABLE longest -- or ok=false
-// if none are free. "Fewest chats today" counts chats actually accepted
-// today (not merely assigned), via a live COUNT(*) over chat_conversation
-// rather than a stored counter. FOR UPDATE OF e SKIP LOCKED (scoped to the
-// cs_engineer_status side of the join, since the count comes from an
-// aggregate subquery that isn't itself lockable) lets concurrent callers
-// each grab a different engineer instead of blocking on each other. Used
-// by Escalate directly and by Decline's reassignment fallback.
+// isPending reports whether a chat_conversation row (given its own state
+// and accepted_at) is still awaiting Router.Accept. A pure function --
+// unlike the old single-case isPendingAccept/isStuckPending helpers this
+// replaces, there is now only one pending predicate, since chat_status no
+// longer affects whether a specific conversation counts as confirmed (see
+// the package doc comment).
+func isPending(state string, acceptedAt *time.Time) bool {
+	return state == "OPEN" && acceptedAt == nil
+}
+
+// activeCaseCount counts userID's currently-held cases (state OPEN or
+// ACTIVE, session not yet ended) -- what's compared against
+// max_concurrent_chats everywhere capacity is checked.
+func activeCaseCount(ctx context.Context, tx pgx.Tx, userID string) (int, error) {
+	var count int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) FROM chat_conversation
+		WHERE assignee_id = $1 AND state IN ('OPEN', 'ACTIVE') AND session_ended_at IS NULL
+	`, userID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count active cases: %w", err)
+	}
+	return count, nil
+}
+
+// lockPendingConversation locks and returns caseID's CaseInfo if its
+// chat_conversation row is currently assigned to userID, still unconfirmed
+// (state OPEN, accepted_at NULL), and not yet ended -- or ok=false
+// otherwise (already accepted, reassigned elsewhere, or never held by
+// userID at all). Shared by Accept and Decline, which both only ever act
+// on a case in exactly this state.
+func lockPendingConversation(ctx context.Context, tx pgx.Tx, caseID, userID string) (CaseInfo, bool, error) {
+	var (
+		caseInfoJSON []byte
+		assigneeID   *string
+		state        string
+		acceptedAt   *time.Time
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT case_info, assignee_id, state, accepted_at
+		FROM chat_conversation WHERE case_id = $1 AND session_ended_at IS NULL
+		FOR UPDATE
+	`, caseID).Scan(&caseInfoJSON, &assigneeID, &state, &acceptedAt)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return CaseInfo{}, false, nil
+	case err != nil:
+		return CaseInfo{}, false, fmt.Errorf("lock conversation: %w", err)
+	}
+	if assigneeID == nil || *assigneeID != userID || !isPending(state, acceptedAt) {
+		return CaseInfo{}, false, nil
+	}
+
+	var c CaseInfo
+	if caseInfoJSON != nil {
+		if err := json.Unmarshal(caseInfoJSON, &c); err != nil {
+			return CaseInfo{}, false, fmt.Errorf("decode case info: %w", err)
+		}
+	}
+	return c, true, nil
+}
+
+// popAvailableEngineer locks and returns an AVAILABLE engineer, other than
+// exclude (pass "" to exclude no one), with spare concurrent-chat capacity:
+// whichever qualifying engineer has the fewest currently-active chats (so
+// work spreads out before anyone is doubled up), ties broken by fewest
+// chats taken today, then by who's been AVAILABLE longest -- or ok=false if
+// none qualify. FOR UPDATE OF e SKIP LOCKED (scoped to the cs_engineer_
+// status side of the joins, since the counts come from aggregate subqueries
+// that aren't themselves lockable) lets concurrent callers each grab a
+// different engineer instead of blocking on each other. Used by Escalate
+// directly and by Decline's reassignment fallback.
 func popAvailableEngineer(ctx context.Context, tx pgx.Tx, exclude string) (userID string, ok bool, err error) {
 	err = tx.QueryRow(ctx, `
 		SELECT e.user_id
 		FROM cs_engineer_status e
+		LEFT JOIN (
+			SELECT assignee_id AS user_id, COUNT(*) AS active_count
+			FROM chat_conversation
+			WHERE assignee_id IS NOT NULL AND state IN ('OPEN', 'ACTIVE') AND session_ended_at IS NULL
+			GROUP BY assignee_id
+		) active ON active.user_id = e.user_id
 		LEFT JOIN (
 			SELECT assignee_id AS user_id, COUNT(*) AS today_count
 			FROM chat_conversation
 			WHERE assignee_id IS NOT NULL
 			  AND updated_at >= CURRENT_DATE AND updated_at < CURRENT_DATE + 1
 			GROUP BY assignee_id
-		) t ON t.user_id = e.user_id
-		WHERE e.chat_status = 'AVAILABLE' AND e.current_case_id IS NULL AND e.user_id != $1
-		ORDER BY COALESCE(t.today_count, 0) ASC, e.available_since ASC
+		) today ON today.user_id = e.user_id
+		WHERE e.chat_status = 'AVAILABLE' AND e.user_id != $1
+		  AND COALESCE(active.active_count, 0) < e.max_concurrent_chats
+		ORDER BY COALESCE(active.active_count, 0) ASC, COALESCE(today.today_count, 0) ASC, e.available_since ASC
 		LIMIT 1
 		FOR UPDATE OF e SKIP LOCKED
 	`, exclude).Scan(&userID)
@@ -801,57 +817,22 @@ func popAvailableEngineer(ctx context.Context, tx pgx.Tx, exclude string) (userI
 	}
 }
 
-// isPendingAccept reports whether a BUSY engineer's current case hasn't
-// actually been confirmed yet (Router.Accept hasn't run for it). PENDING
-// isn't a stored chat_status value -- assignCaseToEngineer sets chat_status
-// = 'BUSY' immediately, the instant capacity is reserved, and this checks
-// accepted_at instead. Deliberately BUSY-only, unlike isStuckPending below:
-// an engineer who's asked to leave (chat_status = 'OFFLINE') should read as
-// OFFLINE everywhere external, not PENDING, even while the timeout sweep is
-// still tracking their unconfirmed case.
-func isPendingAccept(stored Status, hasCase bool, acceptedAt *time.Time) bool {
-	return stored == StatusBusy && hasCase && acceptedAt == nil
-}
-
-// isStuckPending reports whether userID's current case still has nobody
-// confirmed on it, and so still needs the timeout/reassignment safety net
-// (see SweepExpiredPending in timeout.go) and must still be acceptable via
-// Accept. Broader than isPendingAccept above: it also covers an engineer
-// who requested OFFLINE (see SetPresence) before ever confirming this same
-// case. Both "still BUSY, never asked to leave" and "asked to leave, but
-// nobody's confirmed the case yet" are the same underlying problem --
-// nobody has actually taken this case -- so both get the same safety net.
-func isStuckPending(stored Status, hasCase bool, acceptedAt *time.Time) bool {
-	return hasCase && acceptedAt == nil && (stored == StatusBusy || stored == StatusOffline)
-}
-
-// externalStatus is the Status every caller outside this package should
-// see: StatusPending instead of the row's actual BUSY value when
-// isPendingAccept is true, otherwise the stored value unchanged. Every
-// public-facing read goes through this instead of the raw column, so
-// PENDING keeps behaving like a real status to every caller even though
-// it's not one in the database. An OFFLINE engineer holding an unconfirmed
-// case (see isStuckPending) is deliberately reported as OFFLINE here, not
-// PENDING -- their intent to leave should be visible immediately, even
-// though the timeout sweep is still watching their case underneath.
-func externalStatus(stored Status, hasCase bool, acceptedAt *time.Time) Status {
-	if isPendingAccept(stored, hasCase, acceptedAt) {
-		return StatusPending
-	}
-	return stored
-}
-
-// assignCaseToEngineer marks userID BUSY with c as their current case,
-// reserving their capacity immediately. accepted_at stays NULL until
-// Accept confirms it, which is what makes this read back as PENDING rather
-// than genuinely BUSY (see externalStatus) until then.
-func assignCaseToEngineer(ctx context.Context, tx pgx.Tx, userID string, c CaseInfo, caseInfoJSON []byte) error {
+// assignCaseToEngineer records userID as c's assignee, reserving one unit
+// of their concurrent-chat capacity. Deliberately never touches
+// cs_engineer_status.chat_status -- unlike the old single-case model,
+// taking a case no longer implies anything about an engineer's own manual
+// status (see SetPresence's doc comment); a case counts toward capacity
+// purely by existing as an OPEN/ACTIVE, non-ended chat_conversation row
+// with this assignee_id. A no-op if the row doesn't exist yet -- the LOCAL
+// STAND-IN chat_conversation row for a brand-new case is expected to
+// already exist by the time this runs, since csm-portal/backend now
+// creates it (via CreateWorkItem) before calling Escalate.
+func assignCaseToEngineer(ctx context.Context, tx pgx.Tx, userID string, c CaseInfo) error {
 	if _, err := tx.Exec(ctx, `
-		UPDATE cs_engineer_status
-		SET chat_status = 'BUSY', accepted_at = NULL, current_case_id = $1, current_case = $2::jsonb,
-		    available_since = NULL, updated_at = now()
-		WHERE user_id = $3
-	`, c.CaseID, caseInfoJSON, userID); err != nil {
+		UPDATE chat_conversation
+		SET assignee_id = $1, accepted_at = NULL, updated_at = now()
+		WHERE case_id = $2 AND session_ended_at IS NULL
+	`, userID, c.CaseID); err != nil {
 		return fmt.Errorf("assign case to engineer: %w", err)
 	}
 	return nil
