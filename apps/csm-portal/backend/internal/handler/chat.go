@@ -140,7 +140,10 @@ type routingService interface {
 	// chat-routing-service's migrations/000014_rename_engineer_status_table
 	// for why this switched from an email.
 	SetPresence(ctx context.Context, userID string, status routingclient.Status) (routingclient.PresenceResult, error)
-	Completed(ctx context.Context, userID string) (routingclient.CompletedResult, error)
+	// Completed takes caseID because an engineer can now hold several
+	// concurrent conversations at once (see the 2026-09-10
+	// concurrent-chat-capacity change) -- ending one must say which.
+	Completed(ctx context.Context, userID, caseID string) (routingclient.CompletedResult, error)
 	Decline(ctx context.Context, userID, caseID string) (routingclient.DeclineResult, error)
 	Accept(ctx context.Context, userID, caseID string) (routingclient.AcceptResult, error)
 	GetPresence(ctx context.Context, userID string) (routingclient.PresenceDetail, error)
@@ -153,7 +156,13 @@ type routingService interface {
 	// project's chat-persistence-mapping-plan.md) -- they exist only until
 	// entity-service's real generic work_item/chat_conversation/comment
 	// schema ships, at which point these calls move there instead.
-	CreateWorkItem(ctx context.Context, caseID, creatorEmail, subject, initialMessage string) error
+	//
+	// CreateWorkItem now takes the full CaseInfo (rather than four loose
+	// fields) since it durably stores that value as the case's display
+	// blob, and must be called BEFORE Escalate for the same case -- see
+	// HandleEscalate below and routingclient.Client.CreateWorkItem's own
+	// doc comment for why the order matters now.
+	CreateWorkItem(ctx context.Context, ci routingclient.CaseInfo) error
 	AddComment(ctx context.Context, caseID, authorEmail, content string) error
 }
 
@@ -338,6 +347,20 @@ func (h *ChatHandler) HandleEscalate(w http.ResponseWriter, r *http.Request) {
 		Message:        req.Message,
 	}
 
+	// Best-effort: LOCAL STAND-IN persistence (see routingService's own doc
+	// comment) -- creates the work_item/chat_conversation/first-comment
+	// record for this escalation. Must run BEFORE Escalate below: Escalate's
+	// own assignment now writes chat_conversation.assignee_id directly (see
+	// router.Router.CreateWorkItem's doc comment), so that row must already
+	// exist. A failure here is logged, not fatal to this request -- the
+	// live routing decision below still must reach the customer regardless
+	// of whether this bookkeeping call succeeded (a known limitation of the
+	// LOCAL STAND-IN tables, not new: this case just won't count toward the
+	// assigned engineer's capacity until the row exists).
+	if err := h.routing.CreateWorkItem(r.Context(), ci); err != nil {
+		slog.WarnContext(r.Context(), "chat: routing service create work item failed (non-blocking)", "caseId", req.CaseID, "err", err)
+	}
+
 	result, err := h.routing.Escalate(r.Context(), ci)
 	if err != nil {
 		// Routing service unreachable/erroring: fall back to broadcasting
@@ -348,15 +371,6 @@ func (h *ChatHandler) HandleEscalate(w http.ResponseWriter, r *http.Request) {
 		h.publishToEngineers(assignedCaseEvent(ci))
 		writeJSON(w, http.StatusAccepted, []byte(`{"message":"escalation broadcast to available engineers"}`))
 		return
-	}
-
-	// Best-effort: LOCAL STAND-IN persistence (see routingService's own doc
-	// comment) -- creates the work_item/chat_conversation/first-comment
-	// record for this escalation. Must not block the live routing decision
-	// above, which has already succeeded and must reach the customer
-	// regardless of whether this bookkeeping call does.
-	if err := h.routing.CreateWorkItem(r.Context(), req.CaseID, req.CustomerEmail, ci.Subject, req.Message); err != nil {
-		slog.WarnContext(r.Context(), "chat: routing service create work item failed (non-blocking)", "caseId", req.CaseID, "err", err)
 	}
 
 	switch {
@@ -638,13 +652,15 @@ func (h *ChatHandler) HandleCompleteSession(w http.ResponseWriter, r *http.Reque
 		Timestamp:      now,
 	})
 
-	// Best-effort: release this engineer's routing-service capacity and, if
-	// that immediately drained the waiting queue, deliver the next case to
-	// them the same way a fresh escalation would arrive. A failure here is
+	// Best-effort: release this engineer's routing-service capacity for
+	// this specific case (they may still hold other concurrent chats, see
+	// the 2026-09-10 concurrent-chat-capacity change) and, if that
+	// immediately drained the waiting queue, deliver the next case to them
+	// the same way a fresh escalation would arrive. A failure here is
 	// logged, not surfaced to the caller — the session has already ended
 	// successfully from the engineer's point of view, matching this
 	// handler's existing best-effort treatment of notifyBackendV2 above.
-	if result, err := h.routing.Completed(r.Context(), user.UserID); err != nil {
+	if result, err := h.routing.Completed(r.Context(), user.UserID, caseID); err != nil {
 		slog.ErrorContext(r.Context(), "chat: routing service completed failed", "userID", user.UserID, "err", err)
 	} else if result.AssignedCase != nil {
 		h.publishToEngineer(user.UserID, assignedCaseEvent(*result.AssignedCase))
@@ -684,15 +700,16 @@ func (h *ChatHandler) HandleSetPresence(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
 		return
 	}
-	// BUSY is intentionally excluded: it's a derived state the routing
-	// service sets automatically when a case is assigned (see
-	// router.Router.SetPresence/Escalate), never something an engineer
-	// requests directly. The CSM portal's status dropdown doesn't offer it
-	// either (see EngineerStatusMenu.tsx) — this is the defense-in-depth
-	// backstop for any other caller of this endpoint.
+	// AVAILABLE, BUSY, and OFFLINE are all requestable directly now (see
+	// the 2026-09-10 concurrent-chat-capacity change): chat_status is a
+	// plain manual toggle independent of case load, and BUSY is a real
+	// do-not-disturb an engineer can set without dropping any case they
+	// already hold (see router.Router.SetPresence's doc comment). There is
+	// still no PENDING here -- that's a per-case fact, never a top-level
+	// status an engineer requests (see routingclient.CaseStatus.Pending).
 	status := routingclient.Status(req.Status)
 	switch status {
-	case routingclient.StatusAvailable, routingclient.StatusOffline:
+	case routingclient.StatusAvailable, routingclient.StatusBusy, routingclient.StatusOffline:
 		// valid
 	default:
 		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
@@ -706,8 +723,12 @@ func (h *ChatHandler) HandleSetPresence(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if result.AssignedCase != nil {
-		h.publishToEngineer(user.UserID, assignedCaseEvent(*result.AssignedCase))
+	// Going AVAILABLE can drain more than one queued case at once now (see
+	// router.Router.SetPresence's queue-drain, capped at this engineer's own
+	// max_concurrent_chats) -- unlike Completed/Decline/a timeout, which
+	// each free at most one slot, so deliver every one of them.
+	for _, c := range result.AssignedCases {
+		h.publishToEngineer(user.UserID, assignedCaseEvent(c))
 	}
 
 	writeJSONValue(w, http.StatusOK, result)
@@ -718,8 +739,9 @@ func (h *ChatHandler) HandleSetPresence(w http.ResponseWriter, r *http.Request) 
 // instead of assuming a default itself — the routing service's own default
 // for an engineer it has never seen (OFFLINE — see router.Router.
 // GetPresence) is exposed here rather than hardcoded a second time in the
-// browser. Also passes through currentCase when PENDING or BUSY, so the
-// browser can rehydrate a lost pending alert or active session's local
+// browser. Also passes through every case the engineer currently holds
+// (pending or accepted alike, see routingclient.PresenceDetail.Cases), so
+// the browser can rehydrate lost pending alerts or active sessions' local
 // widget state after losing it (a refresh, a closed tab) instead of the
 // engineer being stuck with nothing in the UI to act on.
 func (h *ChatHandler) HandleGetPresence(w http.ResponseWriter, r *http.Request) {
