@@ -13,11 +13,9 @@ info:
 
 
     Engineers are identified throughout this API by their IdP `userid` claim
-    (`userId` on every request/response below), not their email — see the
-    README's 2026-09-07 DB schema review note. A per-customer "sticky"
-    routing preference used to run ahead of the least-busy ranking; it was
-    dropped in that same review as fully derivable, unnecessary state (see
-    `migrations/000013_drop_customer_engineer_assignments.up.sql`).
+    (`userId` on every request/response below), not their email. There is no
+    per-customer "sticky" routing preference — every escalation is routed
+    purely by current availability and load.
 
 
     Every route under `/route/*` is server-to-server only, authenticated with
@@ -102,8 +100,9 @@ paths:
       summary: >-
         Set an engineer's presence to AVAILABLE or OFFLINE. PENDING and BUSY
         are derived states and are rejected if requested directly (400).
-        Mid-session, OFFLINE only sets a deferred pendingOffline flag; the
-        active session is untouched.
+        Mid-session, OFFLINE takes effect immediately on chat_status; the
+        active case itself is untouched until it's separately resolved via
+        accept, decline, completion, or a timeout.
       operationId: setPresence
       requestBody:
         required: true
@@ -132,9 +131,10 @@ paths:
     post:
       tags: [routing]
       summary: >-
-        Signal that an engineer's current session has ended. Goes OFFLINE
-        (no queue pickup) if pendingOffline had been set; otherwise rejoins
-        AVAILABLE and immediately takes the next queued case, if any.
+        Signal that an engineer's current session has ended. Goes fully
+        idle with no queue pickup if the engineer is OFFLINE (having
+        requested it mid-session, or otherwise); otherwise rejoins AVAILABLE
+        and immediately takes the next queued case, if any.
       operationId: completed
       requestBody:
         required: true
@@ -490,9 +490,6 @@ components:
       properties:
         applied:
           type: boolean
-        pendingOffline:
-          type: boolean
-          description: Meaningful only when the engineer was mid-session at the time of the call.
         assignedCase:
           $ref: '#/components/schemas/CaseInfo'
 
@@ -509,7 +506,7 @@ components:
       properties:
         removed:
           type: boolean
-          description: True if the engineer went fully OFFLINE (pendingOffline had been set) and did not rejoin the pool or take a queued case.
+          description: True if the engineer was OFFLINE at completion time and did not rejoin the pool or take a queued case.
         rejoined:
           type: boolean
           description: True if the engineer went back to AVAILABLE (possibly immediately re-assigned if assignedCase is also set).

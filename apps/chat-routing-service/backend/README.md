@@ -6,21 +6,17 @@ live-chat escalation from the customer portal. It sits between
 every case/session HTTP route — and PostgreSQL, where engineer presence and
 the waiting queue are persisted.
 
-Before this service existed, an escalation was broadcast to *every*
-connected engineer and "accepting" was first-`PATCH`-wins. This service
-replaces that with real state: engineers declare themselves
-`AVAILABLE` / `OFFLINE` (`PENDING` and `BUSY` are derived, never a direct
-request — see below), an escalation is routed to exactly one engineer —
-whoever's least busy today — and anyone who arrives while all engineers
-are busy waits in a FIFO queue that drains automatically as engineers free
-up. An assigned engineer shows `PENDING` (capacity reserved, alert not yet
-acted on) until they explicitly call `POST /route/accept`, only then
-becoming `BUSY` — the CSM portal's status bar never shows Busy before the
-engineer has actually accepted the case.
+Escalations are routed to exactly one engineer — whoever's least busy
+today — instead of being broadcast to everyone. Anyone who arrives while
+all engineers are busy waits in a FIFO queue that drains automatically as
+engineers free up. An assigned engineer shows `PENDING` (capacity reserved,
+alert not yet acted on) until they explicitly call `POST /route/accept`,
+only then becoming `BUSY` — the CSM portal's status bar never shows Busy
+before the engineer has actually accepted the case.
 
 Engineers are identified throughout this service by their IdP `userid`
-claim, not their email — see the 2026-09-07 DB schema review note in
-[Data model](#data-model) below.
+claim, not their email — this service stores no user profile data of its
+own (see [Data model](#data-model)).
 
 ## Architecture
 
@@ -109,23 +105,12 @@ next tier only when the previous one comes up empty:
 
 | Priority | Rule | Notes |
 |---|---|---|
-| 1 · Least busy | Whichever `AVAILABLE` engineer has **accepted the fewest chats today**. | Computed live with `COUNT(*)` over `chat_conversation` for rows where `assignee_id` matches and `updated_at` falls in `[CURRENT_DATE, CURRENT_DATE + 1)` — not a stored counter, so there's no lazy-reset bookkeeping to get wrong; an engineer with zero rows today is simply `0`. **Note the metric change:** this used to count chats **assigned** today (via the now-removed `assignment_log`); since `chat_conversation.assignee_id` is only set once an engineer actually accepts (`setConversationAssignee`), it now counts chats **accepted** today instead — an engineer who's repeatedly assigned-then-declined no longer looks busier than they really are. Deliberate, not an oversight — see `migrations/000011_drop_assignment_log.up.sql`. |
-| 2 · Tie-break | Among engineers tied on chats today, whoever has been `AVAILABLE` the **longest** (`available_since` ascending). | This is the same "came online first" ordering the original FIFO design used for everyone — now it only kicks in on a tie. |
+| 1 · Least busy | Whichever `AVAILABLE` engineer has **accepted the fewest chats today**. | Computed live with `COUNT(*)` over `chat_conversation` for rows where `assignee_id` matches and `updated_at` falls in `[CURRENT_DATE, CURRENT_DATE + 1)` — not a stored counter, so there's no lazy-reset bookkeeping to get wrong; an engineer with zero rows today is simply `0`. This counts chats **accepted** today, not merely assigned — an engineer who's repeatedly assigned-then-declines doesn't look busier than they really are. |
+| 2 · Tie-break | Among engineers tied on chats today, whoever has been `AVAILABLE` the **longest** (`available_since` ascending). | |
 | 3 · Queue | If no engineer is `AVAILABLE` at all, the case's `chat_queue` row stays `WAITING_FOR_ENGINEER` (FIFO by `created_at`). | Once an engineer frees up, they claim the oldest waiting row directly (see `SetPresence` / `Completed` below); least-busy ranking isn't re-applied to queued cases. |
 
-A per-customer "sticky" preference — try to route a returning customer back
-to whoever last handled them — used to run before tier 1 above. It was
-dropped in the 2026-09-07 DB schema review as fully derivable, unnecessary
-state to maintain — see `migrations/000013_drop_customer_engineer_assignments.up.sql`
-and [Data model](#data-model)'s schema-review note.
-
-`chat_queue_engineer_assignment` is **not** written at assignment time — it
-records the *outcome* of an assignment instead (`CONNECTED` on `Accept`,
-`REJECTED` on `Decline`, `TIMED_OUT` on a sweep), which is what makes it
-unsuitable for the least-busy metric above — see
-[Data model](#data-model). `Decline`'s own reassignment step reuses tiers
-1/2 (least-busy, tie-broken by online time) excluding the declining
-engineer.
+There is no per-customer stickiness — every escalation is routed purely by
+current availability and load, never by who handled that customer last.
 
 ## Presence state machine
 
@@ -135,29 +120,27 @@ check below (mid-session handling, `Decline`'s own-case check); the only
 thing that separates them is `Router.Accept`.
 
 **Internal representation note:** `cs_engineer_status.chat_status` itself
-only ever stores `AVAILABLE`, `BUSY`, or `OFFLINE` — `PENDING` was removed
-as a storable enum value (see
-`migrations/000012_remove_pending_status.up.sql`). Whether a `BUSY`
-engineer is actually still `PENDING` is derived from a nullable
-`accepted_at` timestamp (`NULL` = reserved but not yet accepted, set =
-accepted) via `isPendingAccept`/`externalStatus` in `state.go`. This is
-purely an internal storage detail — every HTTP response below still
-reports `PENDING` exactly as it always has.
+only ever stores `AVAILABLE`, `BUSY`, or `OFFLINE` — `PENDING` is not a
+storable enum value. Whether a `BUSY` engineer is actually still `PENDING`
+is derived from a nullable `accepted_at` timestamp (`NULL` = reserved but
+not yet accepted, set = accepted) via `isPendingAccept`/`externalStatus` in
+`state.go`. This is purely an internal storage detail — every HTTP response
+below still reports `PENDING` exactly as if it were a stored value.
 
 | From | Request | Result |
 |---|---|---|
 | any, idle | `AVAILABLE` | joins the pool (`available_since` set); if the queue has a `WAITING_FOR_ENGINEER` row, immediately claims the oldest one and assigns it (engineer becomes `PENDING`, not `BUSY` — see `Accept` below) |
 | any, idle | `OFFLINE` | out of the pool |
-| mid-session (`PENDING` or `BUSY`, `current_case` set) | `OFFLINE` requested | **deferred** — `pending_offline` is set, engineer stays `PENDING`/`BUSY` until the session ends |
-| mid-session | `AVAILABLE` requested | just clears `pending_offline` if it was set; the session itself is untouched (one dedicated session, can't free early) |
-| `PENDING` on `caseId` | `POST /route/accept {userId, caseId}` | flips to `BUSY` (internally: sets `accepted_at = now()`), **deletes the case's `chat_queue` row**, and a `CONNECTED` row is recorded in `chat_queue_engineer_assignment`. A stale accept (already declined/reassigned/accepted, or a different `caseId`) reports `{applied:false}` rather than erroring — see `Router.Accept`'s own doc comment. |
-| `PENDING` on `caseId`, too long | (no explicit request — a periodic `POST /route/sweep-timeouts` call finds it) | the engineer is taken `OFFLINE` (not re-queued as available — they didn't respond, so immediately handing them another case would likely repeat the timeout) and the case is reassigned to the next available engineer, or its `chat_queue` row flips back to `WAITING_FOR_ENGINEER` if nobody's free — same outcome shape as a `Decline`, just triggered by elapsed time instead of the engineer's own click; either way a `TIMED_OUT` row is recorded in `chat_queue_engineer_assignment` |
+| mid-session (`PENDING` or `BUSY`, `current_case` set) | `OFFLINE` requested | takes effect **immediately** — `chat_status` flips to `OFFLINE` right away, but `current_case`/`accepted_at` are left untouched until the session is actually resolved via `Accept`, `Decline`, `Completed`, or a timeout |
+| mid-session | `AVAILABLE` or `BUSY` requested | undoes an earlier mid-session `OFFLINE` request by flipping `chat_status` back to `BUSY` (no-op if they weren't `OFFLINE`); the session itself is untouched either way (one dedicated session, can't free early) |
+| `PENDING` on `caseId` | `POST /route/accept {userId, caseId}` | sets `accepted_at = now()` without forcing `chat_status` back to `BUSY` (so an engineer who went `OFFLINE` mid-session can still accept), **deletes the case's `chat_queue` row**, and a `CONNECTED` row is recorded in `chat_queue_engineer_assignment`. A stale accept (already declined/reassigned/accepted, or a different `caseId`) reports `{applied:false}` rather than erroring. |
+| `PENDING` on `caseId`, too long | (no explicit request — a periodic `POST /route/sweep-timeouts` call finds it) | the engineer is left/taken `OFFLINE` (not re-queued as available — they didn't respond, so immediately handing them another case would likely repeat the timeout) and the case is reassigned to the next available engineer, or its `chat_queue` row flips back to `WAITING_FOR_ENGINEER` if nobody's free — same outcome shape as a `Decline`, just triggered by elapsed time instead of the engineer's own click; either way a `TIMED_OUT` row is recorded in `chat_queue_engineer_assignment`. This sweep also catches an engineer who went `OFFLINE` mid-session before ever confirming the case, not just one still sitting `BUSY`. |
 
-**On session completion:** if `pending_offline` was set, the engineer goes
-straight to `OFFLINE` and does **not** rejoin the pool or take a queued
-case. Otherwise, the engineer becomes `AVAILABLE`, rejoins the pool, and the
-router immediately tries to claim the queue's oldest waiting row (again as
-`PENDING`).
+**On session completion:** if the engineer is `OFFLINE` (having requested it
+mid-session, or otherwise), they go straight to fully idle and do **not**
+rejoin the pool or take a queued case. Otherwise, the engineer becomes
+`AVAILABLE`, rejoins the pool, and the router immediately tries to claim the
+queue's oldest waiting row (again as `PENDING`).
 
 **On decline** (dismissing an alert before accepting): a `REJECTED` row is
 recorded in `chat_queue_engineer_assignment`, the declining engineer is
@@ -166,68 +149,35 @@ next-best available engineer by the same least-busy/tie-break ranking
 (excluding the decliner, and again assigned as `PENDING` — the
 `chat_queue` row stays `ASSIGNED`, just to someone else), or its
 `chat_queue` row flips back to `WAITING_FOR_ENGINEER`. Because that row is
-never deleted and re-inserted — only ever updated in place, from Escalate
-until Accept — it keeps its **original** `created_at`, which is what puts
+never deleted and re-inserted — only ever updated in place, from `Escalate`
+until `Accept` — it keeps its **original** `created_at`, which is what puts
 it ahead of every case that arrived after it without any separate
 "front of queue" flag.
 
 ## Data model
 
-Three tables, in their own schema, separate from `entity-service`'s flat
-`cases` table:
+Three tables, in their own `chat_routing` schema, separate from
+`entity-service`'s flat `cases` table:
 
 | Table | Holds | Ordering / lookup |
 |---|---|---|
-| `cs_engineer_status` | `user_id` (PK), `chat_status` (`AVAILABLE`/`BUSY`/`OFFLINE` only — `PENDING` is derived, see [Presence state machine](#presence-state-machine)), `pending_offline`, `current_case_id` / `current_case` (JSONB), `accepted_at`, `available_since` | `available_since` — oldest-idle-first (tier-2 tie-break) |
-| `chat_queue_engineer_assignment` | one append-only row per assignment **outcome**: `conversation_id`, `engineer_id`, `status` (`CONNECTED`/`REJECTED`/`TIMED_OUT`), `occurred_at` | indexed on `(conversation_id, occurred_at)` and `(engineer_id, occurred_at)`; a pure audit trail of accept/decline/timeout outcomes — see the note below on why least-busy ranking doesn't read this table |
+| `cs_engineer_status` | `user_id` (PK, the IdP's `userid` claim), `chat_status` (`AVAILABLE`/`BUSY`/`OFFLINE` only — `PENDING` is derived, see [Presence state machine](#presence-state-machine)), `current_case_id` / `current_case` (JSONB), `accepted_at`, `available_since` | `available_since` — oldest-idle-first (tier-2 tie-break) |
+| `chat_queue_engineer_assignment` | one append-only row per assignment **outcome**: `conversation_id`, `engineer_id`, `status` (`CONNECTED`/`REJECTED`/`TIMED_OUT`), `occurred_at` | indexed on `(conversation_id, occurred_at)` and `(engineer_id, occurred_at)`; a pure audit trail of accept/decline/timeout outcomes — it isn't written at assignment time, so it can't answer "how many chats was this engineer assigned today" (see [Assignment priority](#assignment-priority)) |
 | `chat_queue` | one row **per active (unaccepted) escalation**, from `Escalate` until `Accept` — `chat_conversation_id` (PK), `case_info` (JSONB), `status` (`WAITING_FOR_ENGINEER`/`ASSIGNED`) | `(created_at, chat_conversation_id)` ascending among `WAITING_FOR_ENGINEER` rows — a fresh case sorts by arrival time, and a reassigned/requeued row keeps its *original* `created_at` (see [Presence state machine](#presence-state-machine)) since it's only ever updated in place, never deleted and re-inserted |
-
-**2026-09-07 DB schema review.** A meeting that day (Sajith Ekanayaka,
-Mifraz Murthaja) reviewed this schema end to end — see the project's
-`db-schema-review-2026-09-07-outcomes.md` doc for the full account. Three
-outcomes landed here:
-
-- **`customer_engineer_assignments` ("sticky routing") is gone.** Confirmed
-  fully derivable, not state this service needs to maintain — see
-  `migrations/000013_drop_customer_engineer_assignments.up.sql`.
-- **`engineers` is now `cs_engineer_status`, keyed by `user_id`, with no
-  `email` column at all.** `user_id` is the IdP's stable per-account
-  `userid` claim (`csm-portal/backend`'s `middleware.UserInfo.UserID`) —
-  the same value this table's PK already stored as `engineer_id` before
-  this migration, just without a separate `email` column alongside it
-  ("we don't need to store email here because it's there in the user
-  table"). Every route, the SDK, and every caller now identify an engineer
-  by this ID — see [HTTP surface](#http-surface) and
-  `migrations/000014_rename_engineer_status_table.up.sql`.
-- **`chat_queue` was redesigned**, per the table above — no more bigserial
-  `id`, `requeued`, or "pop the head" delete-on-assignment; one row exists
-  per escalation from `Escalate` until `Accept`, and reassignment is a
-  plain status flip. See
-  `migrations/000015_redesign_chat_queue.up.sql`.
-
-**Deliberate deviation: `case_info` stays a JSONB blob on `chat_queue`.**
-The review's own conclusion was that this duplicates data already in "the
-case table" and should be dropped. That's true once a real, queryable
-case/work-item table exists to read from at dequeue time — this service
-doesn't have one: `entity-service`'s real case data lives in a separate
-service, and even this feature's own LOCAL STAND-IN `work_item`/
-`chat_conversation` tables (see below) aren't populated until *after*
-`Router.Escalate` returns. Dropping `case_info` here with nothing to
-reconstruct it from would mean a queued (or freshly-drained) customer loses
-their subject/message/customer name. Kept for that reason — see the
-migration's own doc comment — and worth revisiting once the LOCAL STAND-IN
-tables are retired in favor of `entity-service`'s real, atomically-created
-work item.
-
-**Least-busy ranking (tier 1 in [Assignment priority](#assignment-priority)) reads `chat_conversation`, not this schema's own tables.** `chat_queue_engineer_assignment` replaced the old `assignment_log`, but — as the table above says — its rows are written at accept/decline/timeout time, not at assignment time, so it can't answer "how many chats was this engineer assigned today" the way `assignment_log` could. `popAvailableEngineer` instead counts rows in `entity-service`'s temporary stand-in `chat_conversation` table (see below) with a matching `assignee_id` and `updated_at` today, which counts chats an engineer has **accepted** today rather than **assigned** — a deliberate, flagged trade-off, not an oversight; see `migrations/000011_drop_assignment_log.up.sql`'s comment for the full reasoning.
 
 `case_info` / `current_case` are stored as JSONB blobs (`router.CaseInfo` —
 `caseId`, `conversationId`, `projectId`, `subject`, `customerEmail`,
-`customerName`, `message`) rather than normalized columns: this service
-never queries *into* that blob by any field other than `caseId`
-(`current_case`) or `conversationId` (`case_info`, keyed by
-`chat_conversation_id`), and it means `csm-portal/backend` can add a field
-without a migration here.
+`customerName`, `message`) rather than normalized columns, kept for two
+reasons: this service never queries *into* that blob by any field other
+than `caseId` (`current_case`) or `conversationId` (`case_info`, keyed by
+`chat_conversation_id`); and `entity-service`'s real case data lives in a
+separate service, with even this feature's own temporary `work_item`/
+`chat_conversation` stand-in tables (see
+[Integrating from another service](#integrating-from-another-service))
+not populated until *after* `Router.Escalate` returns — so a queued or
+freshly-drained customer would otherwise lose their subject/message/
+customer name with nothing to reconstruct it from. Worth revisiting once
+`entity-service`'s real, atomically-created work item ships.
 
 **These tables live in their own `chat_routing` Postgres schema, inside the
 *same database* `entity-service` uses** (not a separate database) — see
@@ -241,41 +191,9 @@ resolution happens once per connection, not once per query. A bare
 parser rejects it outright), which is why it's done this way instead of in
 the connection string.
 
-See `migrations/000001_create_engineers.up.sql`,
-`migrations/000002_create_escalation_queue.up.sql`,
-`migrations/000003_add_sticky_routing_and_chat_counts.up.sql`,
-`migrations/000004_engineer_id_primary_key.up.sql`,
-`migrations/000005_dynamic_chat_counts.up.sql` (drops the old
-`chats_today`/`chats_today_date` columns in favor of `assignment_log`),
-`migrations/000006_add_pending_status.up.sql` (adds the `PENDING` enum
-value), and
-`migrations/000007_create_chat_stub_workitem_tables.up.sql` (the temporary
-`work_item`/`chat_conversation`/`comment` stand-in tables — see
-[Integrating from another service](#integrating-from-another-service))
-for that earlier schema, including the check constraints that keep
-`current_case_id`/`current_case` consistent and `available_since`
-meaningful only while truly idle-and-free.
-
-A later round of schema-review changes is spread across four more
-migrations: `migrations/000008_rename_chat_queue_drop_order_key.up.sql`
-(`escalation_queue` → `chat_queue`, `order_key` → `requeued` — `requeued`
-was itself dropped again by 000015 below),
-`migrations/000009_create_chat_queue_engineer_assignment.up.sql` (the new
-outcome-audit table replacing `assignment_log`),
-`migrations/000010_chat_conversation_state.up.sql` (adds
-`chat_conversation.state`, drops its unused `conversation_id` column), and
-`migrations/000011_drop_assignment_log.up.sql` (drops `assignment_log` —
-see the least-busy-metric note above).
-
-A final round, from the 2026-09-07 schema review itself, is
-`migrations/000012_remove_pending_status.up.sql` (adds
-`cs_engineer_status.accepted_at`, née `engineers.accepted_at`, and rebuilds
-the status enum without `PENDING` — see [Presence state machine](#presence-state-machine)'s
-internal-representation note),
-`migrations/000013_drop_customer_engineer_assignments.up.sql`,
-`migrations/000014_rename_engineer_status_table.up.sql`, and
-`migrations/000015_redesign_chat_queue.up.sql` — the three schema-review
-outcomes described above.
+Full schema history and rationale for each change lives in
+[`migrations/`](./migrations) (one pair of `.up`/`.down` files per change,
+each with its own comment) rather than here.
 
 ## HTTP surface
 
@@ -286,7 +204,7 @@ All routes below `/route/*` require the `X-Routing-Service-Token` header
 | Method | Path | Body / params | Response |
 |---|---|---|---|
 | `POST` | `/route/escalate` | `CaseInfo` fields | `{engineerId}` or `{queued:true, position:N}` |
-| `POST` | `/route/presence` | `{userId, status}` | `{applied, pendingOffline?, assignedCase?}` |
+| `POST` | `/route/presence` | `{userId, status}` | `{applied, assignedCase?}` |
 | `POST` | `/route/completed` | `{userId}` | `{removed, rejoined, assignedCase?}` |
 | `POST` | `/route/decline` | `{userId, caseId}` | `{reassignedTo?, requeued?}` |
 | `POST` | `/route/accept` | `{userId, caseId}` | `{applied}` — `PENDING` → `BUSY`; `false` if stale (see [Presence state machine](#presence-state-machine)) |
@@ -296,11 +214,7 @@ All routes below `/route/*` require the `X-Routing-Service-Token` header
 | `GET` | `/health` | — | `200 OK` |
 
 `userId` is the IdP's stable per-account `userid` claim, everywhere it
-appears above — see [Data model](#data-model)'s schema-review note.
-`POST /route/presence` used to also require an `engineerId` field (to
-populate a new row's PK the first time an email was seen); now that
-`cs_engineer_status` is keyed by `userId` directly, there is nothing else
-to supply on first contact.
+appears above.
 
 A storage/database error on any `/route/*` call returns `502` — the real
 error is logged server-side (`slog`) and never sent to the caller.
@@ -389,24 +303,22 @@ go run ./cmd/server
 - **No timeout or reassignment** if an assigned engineer never accepts the
   session or goes unreachable — a prototype gap that predates and is
   unrelated to persistence.
-- **One database, not two.** This service originally had its own separate
-  `chat_routing` database on the same Postgres server as `entity-service`.
-  It now shares `entity-service`'s actual database instead, isolated at the
-  schema level (`chat_routing` vs `public`) rather than the database level
-  — one less database to create, back up, and reason about, at the cost of
-  the two services' data no longer failing independently of each other
-  (a `entity-service`-database incident, e.g. a bad migration or a restore,
-  now affects this service's state too).
-- **`chat_queue.case_info` still duplicates data conceptually owned
-  elsewhere** — see [Data model](#data-model)'s deviation note. A known,
-  flagged tradeoff of this feature's LOCAL STAND-IN persistence, not an
-  oversight; revisit once `entity-service`'s real work-item schema ships.
+- **One database, not two.** This service shares `entity-service`'s actual
+  database, isolated at the schema level (`chat_routing` vs `public`)
+  rather than the database level — one less database to create, back up,
+  and reason about, at the cost of the two services' data no longer failing
+  independently of each other (an `entity-service`-database incident, e.g.
+  a bad migration or a restore, now affects this service's state too).
+- **`chat_queue.case_info` duplicates data conceptually owned elsewhere** —
+  see [Data model](#data-model). A known, flagged tradeoff of this
+  feature's temporary persistence, not an oversight; revisit once
+  `entity-service`'s real work-item schema ships.
 - **Single-process is the only tested topology.** Every state transition is
   a Postgres transaction rather than an in-process mutex, so multiple
   replicas of this service *should* be safe against the same database, but
   that hasn't been load-tested.
-- Restarting this service no longer loses in-flight routing state — that's
-  the reason it moved off an in-memory map onto Postgres.
+- Restarting this service does not lose in-flight routing state — that's
+  the reason it's backed by Postgres rather than an in-memory map.
 
 ## Related
 
@@ -416,7 +328,6 @@ go run ./cmd/server
   where the SSE fan-out and WebSocket relay this service's decisions ride on
   actually live.
 - `docs/architecture.excalidraw` — a hand-drawn version of an earlier cut of
-  this diagram, for whiteboard-style walkthroughs (predates the
-  least-busy-only assignment logic above — the queue/broadcast-fallback
-  shape is unchanged, but it still shows plain FIFO assignment and a sticky
-  routing tier that no longer exists).
+  this diagram, kept for whiteboard-style walkthroughs. It predates the
+  least-busy-only assignment logic above, so it still shows plain FIFO
+  assignment and a sticky-routing tier that no longer exists.
