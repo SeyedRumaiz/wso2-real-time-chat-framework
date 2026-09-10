@@ -101,18 +101,24 @@ func NewClient(cfg Config) *Client {
 	}
 }
 
-// Status mirrors chat-routing-service/backend/internal/router.Status.
-// Duplicated rather than shared via a common package: chat-routing-service
-// and this SDK are versioned and deployed independently, and this HTTP API
-// is their only coupling point.
+// Status mirrors chat-routing-service/backend/internal/router.Status — a
+// plain three-way manual toggle, independent of how many cases an engineer
+// is actually holding. Duplicated rather than shared via a common package:
+// chat-routing-service and this SDK are versioned and deployed
+// independently, and this HTTP API is their only coupling point.
+//
+// Never PENDING: "pending" (assigned, not yet accepted) is a per-case fact
+// now, not a top-level engineer status — see CaseStatus.Pending. Removed
+// alongside the 2026-09-10 concurrent-chat-capacity change (see the
+// project's db-schema-review-2026-09-07-outcomes.md); a caller still
+// sending "PENDING" to SetPresence gets a 400 from that endpoint, same as
+// it always has for any other invalid value.
 type Status string
 
 const (
 	StatusAvailable Status = "AVAILABLE"
-	// StatusPending is an engineer assigned a case but who has not yet
-	// clicked Accept -- see chat-routing-service's router.StatusPending
-	// and router.Router.Accept.
-	StatusPending Status = "PENDING"
+	// StatusBusy is a manual do-not-disturb toggle: takes no new
+	// assignments, but does not affect cases already held.
 	StatusBusy    Status = "BUSY"
 	StatusOffline Status = "OFFLINE"
 )
@@ -120,7 +126,8 @@ const (
 // CaseInfo mirrors router.CaseInfo — the case fields carried through an
 // escalation, queueing, or reassignment. Field names and JSON tags match
 // that service's escalateRequest/CaseInfo wire shape exactly, so a CaseInfo
-// value can be marshaled directly as the POST /route/escalate body.
+// value can be marshaled directly as the POST /route/escalate or
+// POST /route/workitem body.
 type CaseInfo struct {
 	CaseID         string `json:"caseId"`
 	ConversationID string `json:"conversationId"`
@@ -129,6 +136,19 @@ type CaseInfo struct {
 	CustomerEmail  string `json:"customerEmail,omitempty"`
 	CustomerName   string `json:"customerName,omitempty"`
 	Message        string `json:"message,omitempty"`
+}
+
+// CaseStatus mirrors router.CaseStatus — one case an engineer currently
+// holds, as reported by GetPresence. Replaces the old single
+// PresenceDetail.CurrentCase/PendingSince pair now that an engineer can
+// hold more than one case at once.
+type CaseStatus struct {
+	CaseInfo
+	// Pending is true until Accept confirms this specific case.
+	Pending bool `json:"pending"`
+	// AssignedAt is when this case was assigned to this engineer (not when
+	// created) — the countdown to the timeout sweep runs from here.
+	AssignedAt string `json:"assignedAt"`
 }
 
 // EscalateResult mirrors router.EscalateResult.
@@ -144,15 +164,24 @@ type EscalateResult struct {
 
 // PresenceResult mirrors router.PresenceResult.
 type PresenceResult struct {
-	Applied        bool      `json:"applied"`
-	PendingOffline bool      `json:"pendingOffline,omitempty"`
-	AssignedCase   *CaseInfo `json:"assignedCase,omitempty"`
+	Applied bool `json:"applied"`
+	// AssignedCases is set when this presence change immediately drained
+	// the queue -- transitioning to AVAILABLE claims cases off the queue
+	// until either it's empty or the engineer's own capacity is full, so
+	// (unlike Completed/Decline/a timeout, which each free at most one
+	// slot) more than one case can land here at once.
+	AssignedCases []CaseInfo `json:"assignedCases,omitempty"`
 }
 
 // CompletedResult mirrors router.CompletedResult.
 type CompletedResult struct {
-	Removed      bool      `json:"removed,omitempty"`
-	Rejoined     bool      `json:"rejoined,omitempty"`
+	// Ended is true when the given case was actually an open (not
+	// already-ended) conversation assigned to the caller -- false is a
+	// no-op, guarding against a duplicate call for a session that already
+	// ended.
+	Ended bool `json:"ended,omitempty"`
+	// AssignedCase is set when ending this conversation freed a slot that
+	// was immediately backfilled from the waiting queue.
 	AssignedCase *CaseInfo `json:"assignedCase,omitempty"`
 }
 
@@ -173,11 +202,14 @@ type AcceptResult struct {
 	Applied bool `json:"applied"`
 }
 
-// TimeoutResult mirrors router.TimeoutResult -- one PENDING engineer's
-// outcome from a call to SweepTimeouts: they'd been assigned a case and
-// never accepted it within chat-routing-service's own configured
-// PENDING_TIMEOUT_SECONDS, so that service reassigned or requeued it on
-// their behalf and took them OFFLINE.
+// TimeoutResult mirrors router.TimeoutResult -- one conversation's outcome
+// from a call to SweepTimeouts: it had been assigned to an engineer and
+// never accepted within chat-routing-service's own configured
+// PENDING_TIMEOUT_SECONDS, so that service reassigned or requeued it.
+// Unlike before the 2026-09-10 concurrent-chat-capacity change, the
+// unresponsive engineer's chat_status is left untouched -- they may well
+// be mid-conversation on a different concurrent case at the same time (see
+// router.Router.SweepExpiredPending's own doc comment).
 type TimeoutResult struct {
 	UserID       string    `json:"userId"`
 	CaseID       string    `json:"caseId"`
@@ -256,12 +288,15 @@ func (c *Client) SetPresence(ctx context.Context, userID string, status Status) 
 }
 
 // Completed calls POST /route/completed, reporting that userID just ended
-// their current session.
-func (c *Client) Completed(ctx context.Context, userID string) (CompletedResult, error) {
+// their session on caseID -- one of possibly several concurrent cases they
+// hold. A no-op (Ended: false) if caseID isn't currently an open
+// conversation assigned to userID.
+func (c *Client) Completed(ctx context.Context, userID, caseID string) (CompletedResult, error) {
 	var out CompletedResult
 	body := struct {
 		UserID string `json:"userId"`
-	}{UserID: userID}
+		CaseID string `json:"caseId"`
+	}{UserID: userID, CaseID: caseID}
 	err := c.do(ctx, http.MethodPost, "/route/completed", body, &out)
 	return out, err
 }
@@ -279,9 +314,10 @@ func (c *Client) Decline(ctx context.Context, userID, caseID string) (DeclineRes
 }
 
 // Accept calls POST /route/accept, confirming userID is accepting the case
-// (caseID) they were assigned -- flips PENDING to BUSY server-side. See
-// router.Router.Accept's own doc comment for when Applied comes back
-// false (a stale accept) rather than an error.
+// (caseID) they were assigned -- moves that one conversation from OPEN to
+// ACTIVE server-side; any other concurrent case userID holds is untouched
+// either way. See router.Router.Accept's own doc comment for when Applied
+// comes back false (a stale accept) rather than an error.
 func (c *Client) Accept(ctx context.Context, userID, caseID string) (AcceptResult, error) {
 	var out AcceptResult
 	body := struct {
@@ -295,21 +331,17 @@ func (c *Client) Accept(ctx context.Context, userID, caseID string) (AcceptResul
 // CreateWorkItem calls POST /route/workitem -- LOCAL STAND-IN persistence,
 // see chat-routing-service's internal/router/workitem.go package doc
 // comment. Creates the work_item + chat_conversation pair (plus the first
-// comment, if initialMessage is non-empty) for a brand-new escalation.
-// creatorEmail attributes the work item to the CUSTOMER who escalated, not
-// an engineer -- unaffected by chat-routing-service's engineer-identity
-// switch to user IDs (see migrations/000014_rename_engineer_status_table).
-func (c *Client) CreateWorkItem(ctx context.Context, caseID, creatorEmail, subject, initialMessage string) error {
-	body := struct {
-		CaseID         string `json:"caseId"`
-		CreatorEmail   string `json:"creatorEmail"`
-		Subject        string `json:"subject"`
-		InitialMessage string `json:"initialMessage,omitempty"`
-	}{
-		CaseID: caseID, CreatorEmail: creatorEmail,
-		Subject: subject, InitialMessage: initialMessage,
-	}
-	return c.do(ctx, http.MethodPost, "/route/workitem", body, nil)
+// comment, if ci.Message is non-empty) for a brand-new escalation, and
+// durably stores ci itself as the case's display blob (see that method's
+// own doc comment on why this now outlives Accept).
+//
+// Must be called BEFORE Escalate for the same case -- Escalate's own
+// assignment now writes chat_conversation.assignee_id directly, so this
+// row must already exist by the time Escalate runs (see router.Router.
+// CreateWorkItem's doc comment). ci.CustomerEmail attributes the work item
+// to the CUSTOMER who escalated, not an engineer.
+func (c *Client) CreateWorkItem(ctx context.Context, ci CaseInfo) error {
+	return c.do(ctx, http.MethodPost, "/route/workitem", ci, nil)
 }
 
 // AddComment calls POST /route/comment -- LOCAL STAND-IN persistence, same
@@ -327,18 +359,20 @@ func (c *Client) AddComment(ctx context.Context, caseID, authorEmail, content st
 	return c.do(ctx, http.MethodPost, "/route/comment", body, nil)
 }
 
-// PresenceDetail is GetPresence's result -- status plus, when PENDING or
-// BUSY, the case the engineer is currently on (nil otherwise). CurrentCase
-// exists so a caller can rehydrate an active alert or session's UI state
-// after it's been lost client-side (a refresh, a closed tab) even though
-// the engineer is still genuinely holding it server-side.
+// PresenceDetail is GetPresence's result -- the engineer's manual
+// chat_status, their concurrent-chat capacity and current load, and every
+// case they're currently holding (pending or accepted alike) so a caller
+// whose own UI state was lost can rehydrate all of it, instead of leaving
+// the engineer stuck with nothing to act on. Replaces the old single
+// Status/CurrentCase/PendingSince shape now that an engineer can hold more
+// than one case at once (see the 2026-09-10 concurrent-chat-capacity
+// change).
 type PresenceDetail struct {
-	Status      Status    `json:"status"`
-	CurrentCase *CaseInfo `json:"currentCase,omitempty"`
-	// PendingSince is set only when Status is StatusPending -- when this
-	// engineer was assigned their current case. Lets a caller's UI show a
-	// countdown to when SweepTimeouts will reassign it.
-	PendingSince *time.Time `json:"pendingSince,omitempty"`
+	ChatStatus         Status       `json:"chatStatus"`
+	ActiveChats        int          `json:"activeChats"`
+	MaxConcurrentChats int          `json:"maxConcurrentChats"`
+	AtCapacity         bool         `json:"atCapacity"`
+	Cases              []CaseStatus `json:"cases,omitempty"`
 	// PendingTimeoutSeconds is chat-routing-service's own configured
 	// PENDING_TIMEOUT_SECONDS -- always present, a constant rather than
 	// per-engineer state.
@@ -346,7 +380,7 @@ type PresenceDetail struct {
 }
 
 // GetPresence calls GET /route/presence/{userId}, returning StatusOffline
-// (and no case) for an engineer the routing service has never seen a
+// (and no cases) for an engineer the routing service has never seen a
 // presence update from (see router.Router.GetPresence).
 func (c *Client) GetPresence(ctx context.Context, userID string) (PresenceDetail, error) {
 	var out PresenceDetail
@@ -354,8 +388,8 @@ func (c *Client) GetPresence(ctx context.Context, userID string) (PresenceDetail
 	if err != nil {
 		return PresenceDetail{}, err
 	}
-	if out.Status == "" {
-		out.Status = StatusOffline
+	if out.ChatStatus == "" {
+		out.ChatStatus = StatusOffline
 	}
 	return out, nil
 }
