@@ -848,7 +848,7 @@ func externalStatus(stored Status, hasCase bool, acceptedAt *time.Time) Status {
 func assignCaseToEngineer(ctx context.Context, tx pgx.Tx, userID string, c CaseInfo, caseInfoJSON []byte) error {
 	if _, err := tx.Exec(ctx, `
 		UPDATE cs_engineer_status
-		SET chat_status = 'BUSY', accepted_at = NULL, current_case_id = $1, current_case = $2:jsonb,
+		SET chat_status = 'BUSY', accepted_at = NULL, current_case_id = $1, current_case = $2::jsonb,
 		    available_since = NULL, updated_at = now()
 		WHERE user_id = $3
 	`, c.CaseID, caseInfoJSON, userID); err != nil {
@@ -866,7 +866,7 @@ func insertQueueRow(ctx context.Context, tx pgx.Tx, c CaseInfo, caseInfoJSON []b
 	var createdAt time.Time
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO chat_queue (chat_conversation_id, case_info, status)
-		VALUES ($1, $2:jsonb, $3)
+		VALUES ($1, $2::jsonb, $3)
 		RETURNING created_at
 	`, c.ConversationID, caseInfoJSON, status).Scan(&createdAt); err != nil {
 		return 0, fmt.Errorf("insert queue row: %w", err)
