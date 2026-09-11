@@ -158,6 +158,32 @@ func (r *Router) AddComment(ctx context.Context, caseID, authorEmail, content st
 	})
 }
 
+// GetCaseInfo returns caseID's originally-submitted CaseInfo (subject,
+// customer email/name, message, projectId) exactly as CreateWorkItem stored
+// it on chat_conversation.case_info. Used by ConvertToCase's caller
+// (csm-portal/backend's HandleConvertToCase) to build a real entity
+// CreateCaseRequest without the engineer's browser having to resend data
+// this service already has. Unlike DebugWorkItem (verification/debugging
+// only, and missing case_info/projectId entirely), this is a real
+// production dependency.
+func (r *Router) GetCaseInfo(ctx context.Context, caseID string) (CaseInfo, error) {
+	var caseInfoJSON []byte
+	err := r.db.QueryRow(ctx, `SELECT case_info FROM chat_conversation WHERE case_id = $1`, caseID).Scan(&caseInfoJSON)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return CaseInfo{}, fmt.Errorf("%w: case_id=%s", ErrConversationNotFound, caseID)
+	case err != nil:
+		return CaseInfo{}, fmt.Errorf("get case info: %w", err)
+	}
+	var c CaseInfo
+	if caseInfoJSON != nil {
+		if err := json.Unmarshal(caseInfoJSON, &c); err != nil {
+			return CaseInfo{}, fmt.Errorf("get case info: decode: %w", err)
+		}
+	}
+	return c, nil
+}
+
 // DebugWorkItem returns caseID's full work item, chat conversation, and
 // comment transcript in order -- for verification/debugging only.
 func (r *Router) DebugWorkItem(ctx context.Context, caseID string) (WorkItemDetail, error) {

@@ -97,10 +97,13 @@ func main() {
 	mux.HandleFunc("PATCH /route/capacity", h.SetCapacity)
 	// stand-in persistence endpoints until real persistence lands
 	mux.HandleFunc("POST /route/workitem", h.CreateWorkItem)
+	mux.HandleFunc("POST /route/workitem/{caseId}/info", h.GetCaseInfo)
 	mux.HandleFunc("POST /route/comment", h.AddComment)
 	mux.HandleFunc("GET /route/debug/workitem/{caseId}", h.DebugWorkItem)
 	mux.HandleFunc("GET /route/debug/state", h.DebugState)
 	mux.HandleFunc("POST /route/sweep-timeouts", h.SweepTimeouts)
+	// chat-first escalation: engineer-initiated conversion to a real case
+	mux.HandleFunc("POST /route/convert-to-case", h.ConvertToCase)
 
 	// /health sits outside the InternalToken gate below -- ServeMux matches
 	// the exact "GET /health" pattern before falling through to "/", so

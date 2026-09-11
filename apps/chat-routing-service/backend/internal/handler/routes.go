@@ -429,3 +429,109 @@ func (h *RoutingHandler) SetCapacity(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"applied": true})
 }
+
+// caseInfoResponse mirrors router.CaseInfo -- kept as its own type (rather
+// than encoding router.CaseInfo directly) so this endpoint's wire shape can
+// diverge from the router's internal one if it ever needs to.
+type caseInfoResponse struct {
+	CaseID         string `json:"caseId"`
+	ConversationID string `json:"conversationId"`
+	ProjectID      string `json:"projectId,omitempty"`
+	Subject        string `json:"subject,omitempty"`
+	CustomerEmail  string `json:"customerEmail,omitempty"`
+	CustomerName   string `json:"customerName,omitempty"`
+	Message        string `json:"message,omitempty"`
+}
+
+func caseInfoToResponse(c router.CaseInfo) caseInfoResponse {
+	return caseInfoResponse{
+		CaseID:         c.CaseID,
+		ConversationID: c.ConversationID,
+		ProjectID:      c.ProjectID,
+		Subject:        c.Subject,
+		CustomerEmail:  c.CustomerEmail,
+		CustomerName:   c.CustomerName,
+		Message:        c.Message,
+	}
+}
+
+// GetCaseInfo handles POST /route/workitem/{caseId}/info -- see
+// router.Router.GetCaseInfo's own doc comment. Called by csm-portal/
+// backend's HandleConvertToCase to fetch the subject/customer/message data
+// needed to build a real entity CreateCaseRequest, without the engineer's
+// browser having to resend anything this service already has. POST rather
+// than GET only because it lives under the same server-to-server-only
+// surface as the rest of this package's mutating routes; it has no body.
+func (h *RoutingHandler) GetCaseInfo(w http.ResponseWriter, r *http.Request) {
+	caseID := r.PathValue("caseId")
+	if caseID == "" {
+		writeError(w, http.StatusBadRequest, "caseId is required.")
+		return
+	}
+	ci, err := h.router.GetCaseInfo(r.Context(), caseID)
+	if err != nil {
+		if errors.Is(err, router.ErrConversationNotFound) {
+			writeError(w, http.StatusNotFound, "No chat_conversation row exists for this case.")
+			return
+		}
+		writeStorageError(w, "workitem:info", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, caseInfoToResponse(ci))
+}
+
+// convertToCaseRequest is the body for POST /route/convert-to-case.
+// EntityCaseID is the real entity-service case ID csm-portal/backend
+// already obtained from backend-v2's POST /internal/chat/create-case,
+// before calling this -- see the chat-first-escalation plan's §6.
+type convertToCaseRequest struct {
+	UserID       string `json:"userId"`
+	CaseID       string `json:"caseId"`
+	EntityCaseID string `json:"entityCaseId"`
+}
+
+// convertToCaseResponse is ConvertToCase's response shape. AssignedCase is
+// present only when converting freed a slot that immediately backfilled
+// from the waiting queue -- see router.ConvertToCaseResult.
+type convertToCaseResponse struct {
+	AssignedCase *caseInfoResponse `json:"assignedCase,omitempty"`
+}
+
+// ConvertToCase handles POST /route/convert-to-case -- ends caseId's chat
+// session and records entityCaseId against it (state -> CONVERTED_CASE),
+// per router.Router.ConvertToCase. userId must be the engineer currently
+// holding caseId in an accepted (ACTIVE) session; anyone else, or a case
+// that isn't yet accepted, is rejected the same way (ErrNotConversationOwner)
+// since from this engineer's perspective neither case is theirs to convert.
+func (h *RoutingHandler) ConvertToCase(w http.ResponseWriter, r *http.Request) {
+	var req convertToCaseRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.UserID == "" || req.CaseID == "" || req.EntityCaseID == "" {
+		writeError(w, http.StatusBadRequest, "userId, caseId, and entityCaseId are required.")
+		return
+	}
+
+	result, err := h.router.ConvertToCase(r.Context(), req.UserID, req.CaseID, req.EntityCaseID)
+	if err != nil {
+		switch {
+		case errors.Is(err, router.ErrConversationNotFound):
+			writeError(w, http.StatusNotFound, "No chat_conversation row exists for this case.")
+		case errors.Is(err, router.ErrNotConversationOwner):
+			writeError(w, http.StatusConflict, "This case is not an active conversation held by this engineer.")
+		case errors.Is(err, router.ErrAlreadyConverted):
+			writeError(w, http.StatusConflict, "This chat has already been converted to a case or otherwise ended.")
+		default:
+			writeStorageError(w, "convert-to-case", err)
+		}
+		return
+	}
+
+	resp := convertToCaseResponse{}
+	if result.AssignedCase != nil {
+		ci := caseInfoToResponse(*result.AssignedCase)
+		resp.AssignedCase = &ci
+	}
+	writeJSON(w, http.StatusOK, resp)
+}

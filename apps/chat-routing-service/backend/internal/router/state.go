@@ -318,6 +318,133 @@ func (r *Router) Completed(ctx context.Context, userID, caseID string) (Complete
 	return result, nil
 }
 
+// ErrNotConversationOwner is returned by ConvertToCase when caseID exists
+// but isn't currently an ACTIVE conversation held by userID -- covers both
+// "some other engineer holds this" and "this engineer holds it but hasn't
+// accepted yet" without leaking which, since neither is this caller's to
+// convert either way.
+var ErrNotConversationOwner = errors.New("case is not an active conversation held by this engineer")
+
+// ErrAlreadyConverted is returned by ConvertToCase when caseID has already
+// been converted to a case (or otherwise already ended) -- distinguishes a
+// genuine double-conversion/retry from ErrNotConversationOwner and
+// ErrConversationNotFound so a caller can tell them apart.
+var ErrAlreadyConverted = errors.New("chat_conversation is already converted to a case or otherwise ended")
+
+// ConvertToCaseResult mirrors CompletedResult's shape -- converting a chat
+// ends its session exactly like Completed does (see the package doc
+// comment on why this doesn't leave the chat open), so it can free and
+// backfill a capacity slot the same way.
+type ConvertToCaseResult struct {
+	AssignedCase *CaseInfo `json:"assignedCase,omitempty"`
+}
+
+// diagnoseConvertFailure runs after ConvertToCase's UPDATE affects zero
+// rows, to turn that into a specific, useful error -- a single UPDATE's
+// WHERE clause can't say whether the row doesn't exist, belongs to another
+// engineer, isn't accepted yet, or was already ended/converted.
+func diagnoseConvertFailure(ctx context.Context, tx pgx.Tx, caseID, userID string) error {
+	var (
+		assigneeID      *string
+		state           string
+		sessionEndedAt  *time.Time
+		entityCaseIDPtr *string
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT assignee_id, state, session_ended_at, entity_case_id
+		FROM chat_conversation WHERE case_id = $1
+	`, caseID).Scan(&assigneeID, &state, &sessionEndedAt, &entityCaseIDPtr)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return fmt.Errorf("%w: case_id=%s", ErrConversationNotFound, caseID)
+	case err != nil:
+		return fmt.Errorf("convert to case: diagnose: %w", err)
+	}
+	if sessionEndedAt != nil || entityCaseIDPtr != nil {
+		return fmt.Errorf("%w: case_id=%s", ErrAlreadyConverted, caseID)
+	}
+	if assigneeID == nil || *assigneeID != userID || state != "ACTIVE" {
+		return fmt.Errorf("%w: case_id=%s", ErrNotConversationOwner, caseID)
+	}
+	// Row matched every predicate on re-check -- a concurrent change lost a
+	// race with the original UPDATE between the two queries. Rare, but
+	// report it as a conflict rather than a false "not found".
+	return fmt.Errorf("%w: case_id=%s (concurrent update)", ErrAlreadyConverted, caseID)
+}
+
+// ConvertToCase ends userID's session on caseID by converting it into a
+// real case (entityCaseID, already created by the caller -- see
+// csm-portal/backend's HandleConvertToCase, which resolves the deployment/
+// deployed-product and calls entity-service's CreateCase before this is
+// ever invoked) rather than a normal Completed call. Only the engineer
+// currently holding caseID can convert it, and only once they've actually
+// accepted it (state ACTIVE) -- converting something not yet opened isn't
+// meaningful.
+//
+// Deliberately does not allow the chat to continue after conversion (see
+// the package doc comment and this feature's chat-first-escalation-plan.md,
+// "resolved: conversion ends the chat" -- the team decided against running
+// the live chat and the new case side by side): sets session_ended_at
+// exactly like Completed does, and backfills the freed slot the same way.
+func (r *Router) ConvertToCase(ctx context.Context, userID, caseID, entityCaseID string) (ConvertToCaseResult, error) {
+	var result ConvertToCaseResult
+	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE chat_conversation
+			SET entity_case_id = $1, state = 'CONVERTED_CASE', session_ended_at = now(), updated_at = now()
+			WHERE case_id = $2 AND assignee_id = $3 AND state = 'ACTIVE' AND session_ended_at IS NULL AND entity_case_id IS NULL
+		`, entityCaseID, caseID, userID)
+		if err != nil {
+			return fmt.Errorf("convert to case: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return diagnoseConvertFailure(ctx, tx, caseID, userID)
+		}
+
+		// Mirrors Completed's own backfill exactly -- a slot just freed up.
+		var (
+			chatStatus    Status
+			maxConcurrent int
+		)
+		err = tx.QueryRow(ctx, `
+			SELECT chat_status, max_concurrent_chats FROM cs_engineer_status WHERE user_id = $1 FOR UPDATE
+		`, userID).Scan(&chatStatus, &maxConcurrent)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			return nil
+		case err != nil:
+			return fmt.Errorf("lock engineer: %w", err)
+		}
+		if chatStatus != StatusAvailable {
+			return nil
+		}
+		activeCount, err := activeCaseCount(ctx, tx, userID)
+		if err != nil {
+			return err
+		}
+		if activeCount >= maxConcurrent {
+			return nil
+		}
+		c, ok, err := claimOldestWaiting(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if err := assignCaseToEngineer(ctx, tx, userID, c); err != nil {
+			return err
+		}
+		assigned := c
+		result.AssignedCase = &assigned
+		return nil
+	})
+	if err != nil {
+		return ConvertToCaseResult{}, err
+	}
+	return result, nil
+}
+
 // DeclineResult is Decline's outcome: exactly one of ReassignedTo (set,
 // with AssignedCase also set) or Requeued (true) applies, unless the
 // decline itself was a no-op, in which case all three are zero.
