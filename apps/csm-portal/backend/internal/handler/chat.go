@@ -128,6 +128,14 @@ type entityChatClient interface {
 // backend-v2 push.
 type chatEventPusher interface {
 	PushEvent(ctx context.Context, payload []byte) error
+	// CreateCase calls backend-v2's new synchronous POST /internal/chat/
+	// create-case (see HandleConvertToCase) -- unlike PushEvent, NOT
+	// best-effort: it returns the real response body/error rather than
+	// discarding it, since converting a chat needs the new case's real ID
+	// back on the same request. Same *chatnotify.Client satisfies both
+	// methods (same base URL/token) -- this is a second endpoint on that
+	// client, not a second dependency to wire up.
+	CreateCase(ctx context.Context, payload []byte) ([]byte, error)
 }
 
 // routingService abstracts internal/routingclient.Client so tests can fake
@@ -173,6 +181,12 @@ type routingService interface {
 	// doc comment for why the order matters now.
 	CreateWorkItem(ctx context.Context, ci routingclient.CaseInfo) error
 	AddComment(ctx context.Context, caseID, authorEmail, content string) error
+	// GetCaseInfo and ConvertToCase back HandleConvertToCase (the
+	// chat-first-escalation flow's engineer-initiated conversion, see that
+	// method's own doc comment) -- both real, error-surfacing calls, not
+	// best-effort like most of this interface's other side-channel methods.
+	GetCaseInfo(ctx context.Context, caseID string) (routingclient.CaseInfo, error)
+	ConvertToCase(ctx context.Context, userID, caseID, entityCaseID string) (routingclient.ConvertToCaseResult, error)
 }
 
 // ChatHandler implements the live-engineer-chat escalation endpoints.
@@ -209,7 +223,11 @@ type chatEvent struct {
 	CustomerName   string `json:"customerName,omitempty"`
 	EngineerEmail  string `json:"engineerEmail,omitempty"`
 	Message        string `json:"message,omitempty"`
-	Timestamp      string `json:"timestamp"`
+	// EntityCaseID is set only on a "converted_to_case" event (see
+	// HandleConvertToCase) -- the real entity-service case ID the customer's
+	// browser should point to now that this chat has ended.
+	EntityCaseID string `json:"entityCaseId,omitempty"`
+	Timestamp    string `json:"timestamp"`
 }
 
 // publish marshals evt and publishes it on the given hub key. Best-effort
@@ -877,4 +895,135 @@ func (h *ChatHandler) HandleDeclineSession(w http.ResponseWriter, r *http.Reques
 	}
 
 	writeJSON(w, http.StatusOK, []byte(`{"message":"session declined"}`))
+}
+
+// createCaseRequestBody is the payload sent to backend-v2's
+// POST /internal/chat/create-case — exactly the fields routingclient.
+// CaseInfo already carries, since GetCaseInfo below is where they come
+// from; kept as its own type (rather than encoding routingclient.CaseInfo
+// directly) so this outbound wire shape can diverge from that SDK type if
+// either one changes independently later.
+type createCaseRequestBody struct {
+	CaseID         string `json:"caseId"`
+	ConversationID string `json:"conversationId"`
+	ProjectID      string `json:"projectId"`
+	Subject        string `json:"subject"`
+	CustomerEmail  string `json:"customerEmail"`
+	CustomerName   string `json:"customerName"`
+	Message        string `json:"message"`
+}
+
+// createCaseResponseBody is backend-v2's response shape for
+// POST /internal/chat/create-case.
+type createCaseResponseBody struct {
+	EntityCaseID string `json:"entityCaseId"`
+}
+
+// HandleConvertToCase handles POST /chat/sessions/{id}/convert-to-case —
+// browser-facing, behind Auth, engineer-initiated (see the chat-first-
+// escalation plan's §6/§9: the customer never sees this control themselves
+// once a human is on the chat). {id} is chat-routing-service's own case
+// ID, which is also the chat's original conversationId (see that service's
+// workitem.go doc comment — case_id is set once from conversationId and
+// never rewritten) — so, unlike Accept/Complete/Decline, this endpoint
+// needs no request body: everything it needs is already durably stored by
+// chat-routing-service and fetched via GetCaseInfo below, not resent by
+// the browser.
+//
+// Three real, error-surfacing steps run in order, and a failure at any one
+// stops the request rather than falling back to a best-effort log (unlike
+// most of this file's other cross-service calls): a partially-converted
+// chat — a real case created but chat-routing-service never told about it,
+// or vice versa — is a worse state than simply failing the click and
+// leaving the chat exactly as it was.
+//
+//  1. h.routing.GetCaseInfo — the chat's originally-submitted subject/
+//     customer/message/projectId, as chat-routing-service already has it.
+//  2. h.notify.CreateCase — backend-v2's new synchronous endpoint, which
+//     resolves a deployment/deployed-product for that project and creates
+//     the real entity-service case (see that handler's own doc comment).
+//  3. h.routing.ConvertToCase — ends this chat session server-side and
+//     records the new entityCaseId (mirrors Completed; see router.Router.
+//     ConvertToCase's doc comment), backfilling the queue exactly like any
+//     other session end.
+//
+// Only after all three succeed does this best-effort notify the customer's
+// still-open WebSocket (via notifyBackendV2) that their chat ended because
+// it became a case — see chatEvent.EntityCaseID and this file's package doc
+// comment on why that direction is always best-effort.
+func (h *ChatHandler) HandleConvertToCase(w http.ResponseWriter, r *http.Request) {
+	user := middleware.UserInfoFromContext(r.Context())
+	if user == nil {
+		writeError(w, http.StatusUnauthorized, ErrMsgUnauthorized)
+		return
+	}
+
+	caseID := r.PathValue("id")
+	if caseID == "" || !uuidRe.MatchString(caseID) {
+		writeError(w, http.StatusBadRequest, ErrMsgInvalidUUID)
+		return
+	}
+
+	ci, err := h.routing.GetCaseInfo(r.Context(), caseID)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "chat: routing service get case info failed converting to case", "userID", user.UserID, "caseID", caseID, "err", err)
+		writeError(w, http.StatusBadGateway, "Failed to look up this chat's details. Please try again.")
+		return
+	}
+
+	createPayload, err := json.Marshal(createCaseRequestBody{
+		CaseID:         ci.CaseID,
+		ConversationID: ci.ConversationID,
+		ProjectID:      ci.ProjectID,
+		Subject:        ci.Subject,
+		CustomerEmail:  ci.CustomerEmail,
+		CustomerName:   ci.CustomerName,
+		Message:        ci.Message,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, ErrMsgInternal)
+		return
+	}
+
+	respBody, err := h.notify.CreateCase(r.Context(), createPayload)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "chat: backend-v2 create-case failed converting to case", "userID", user.UserID, "caseID", caseID, "err", err)
+		writeError(w, http.StatusBadGateway, "Failed to create a case for this chat. Please try again.")
+		return
+	}
+	var created createCaseResponseBody
+	if err := json.Unmarshal(respBody, &created); err != nil || created.EntityCaseID == "" {
+		slog.ErrorContext(r.Context(), "chat: backend-v2 create-case returned an unusable response", "userID", user.UserID, "caseID", caseID, "err", err)
+		writeError(w, http.StatusBadGateway, "Failed to create a case for this chat. Please try again.")
+		return
+	}
+
+	convertResult, err := h.routing.ConvertToCase(r.Context(), user.UserID, caseID, created.EntityCaseID)
+	if err != nil {
+		// The real case above already exists at this point -- log loudly.
+		// This is a genuinely new failure mode this design introduces (see
+		// the chat-first-escalation plan's §8): the case is real and
+		// visible in the normal case list, but chat-routing-service still
+		// thinks the chat is live. Surfacing the entityCaseId in the error
+		// lets the engineer find the case manually rather than losing track
+		// of it.
+		slog.ErrorContext(r.Context(), "chat: routing service convert to case failed AFTER a real case was already created", "userID", user.UserID, "caseID", caseID, "entityCaseId", created.EntityCaseID, "err", err)
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("Case %s was created, but ending the chat session failed. Please refresh and check the case.", created.EntityCaseID))
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	h.notifyBackendV2(r.Context(), chatEvent{
+		Type:           "converted_to_case",
+		CaseID:         caseID,
+		ConversationID: ci.ConversationID,
+		EngineerEmail:  user.Email,
+		EntityCaseID:   created.EntityCaseID,
+		Timestamp:      now,
+	})
+	if convertResult.AssignedCase != nil {
+		h.publishToEngineer(user.UserID, assignedCaseEvent(*convertResult.AssignedCase))
+	}
+
+	writeJSONValue(w, http.StatusOK, createCaseResponseBody{EntityCaseID: created.EntityCaseID})
 }

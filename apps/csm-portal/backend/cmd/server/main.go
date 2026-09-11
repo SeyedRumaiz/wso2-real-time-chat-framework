@@ -302,6 +302,8 @@ func main() {
 	mux.HandleFunc("POST /chat/sessions/{id}/messages", chatHandler.HandleEngineerMessage)
 	mux.HandleFunc("POST /chat/sessions/{id}/complete", chatHandler.HandleCompleteSession)
 	mux.HandleFunc("POST /chat/sessions/{id}/decline", chatHandler.HandleDeclineSession)
+	// Chat-first escalation: engineer-initiated conversion to a real case.
+	mux.HandleFunc("POST /chat/sessions/{id}/convert-to-case", chatHandler.HandleConvertToCase)
 	mux.HandleFunc("POST /engineers/me/status", chatHandler.HandleSetPresence)
 	mux.HandleFunc("GET /engineers/me/status", chatHandler.HandleGetPresence)
 	mux.HandleFunc("PATCH /engineers/me/capacity", chatHandler.HandleSetMaxConcurrentChats)

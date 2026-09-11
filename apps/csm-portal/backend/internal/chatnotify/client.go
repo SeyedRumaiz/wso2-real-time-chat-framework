@@ -102,3 +102,38 @@ func (c *Client) PushEvent(ctx context.Context, payload []byte) error {
 	}
 	return nil
 }
+
+// CreateCase POSTs payload to backend-v2's POST /internal/chat/create-case
+// and returns the raw JSON response body on success (expected shape:
+// {"entityCaseId": "..."}) . Unlike PushEvent, this is NOT best-effort --
+// see internal/handler/chat.go's HandleConvertToCase, the only caller:
+// converting a chat into a real entity-service case needs a genuine
+// synchronous result (the new case's ID) back on the same request, not a
+// fire-and-forget notification, so the response body is returned to the
+// caller instead of being discarded (mirrors how entityChatClient.
+// PatchCase already returns ([]byte, error) elsewhere in this package).
+// Same Config (base URL, shared token) as PushEvent -- this is a second
+// endpoint on the same backend-v2 internal listener, not a new client.
+func (c *Client) CreateCase(ctx context.Context, payload []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/internal/chat/create-case", bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("chatnotify: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(internalTokenHeader, c.token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("chatnotify: create case: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("chatnotify: create case: read response: %w", err)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("chatnotify: create case: upstream returned %d: %s", resp.StatusCode, string(body))
+	}
+	return body, nil
+}
