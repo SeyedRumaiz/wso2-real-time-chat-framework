@@ -35,6 +35,7 @@ import { useAcceptChatSession } from "@features/csm-chat/api/useAcceptChatSessio
 import { useSendChatMessage } from "@features/csm-chat/api/useSendChatMessage";
 import { useCompleteChatSession } from "@features/csm-chat/api/useCompleteChatSession";
 import { useDeclineChatSession } from "@features/csm-chat/api/useDeclineChatSession";
+import { useConvertChatToCase } from "@features/csm-chat/api/useConvertChatToCase";
 import {
   ENGINEER_STATUS_QUERY_KEY,
   useGetEngineerStatus,
@@ -101,11 +102,17 @@ export default function EngineerAlertNotification(): JSX.Element | null {
   const myEmail = useIdTokenClaims()?.email;
   const [casesByCaseId, setCasesByCaseId] = useState<Record<string, CaseEntry>>({});
   const [draftByCaseId, setDraftByCaseId] = useState<Record<string, string>>({});
+  // Per-case error text for a failed "Convert to Case" attempt -- see
+  // handleConvertToCase's own comment on why that failure is surfaced
+  // inline instead of silently clearing the session like handleComplete
+  // does.
+  const [convertErrorByCaseId, setConvertErrorByCaseId] = useState<Record<string, string>>({});
 
   const acceptMutation = useAcceptChatSession();
   const sendMutation = useSendChatMessage();
   const completeMutation = useCompleteChatSession();
   const declineMutation = useDeclineChatSession();
+  const convertMutation = useConvertChatToCase();
   const queryClient = useQueryClient();
   const { data: presence } = useGetEngineerStatus();
 
@@ -137,15 +144,15 @@ export default function EngineerAlertNotification(): JSX.Element | null {
   );
 
   // Removes one case from the cached presence's `cases` array the instant
-  // it's locally dismissed (handleComplete/handleDismiss), rather than
-  // waiting for the mutation's own invalidateQueries to trigger a refetch.
-  // Without this, there's a window — between clearing local state here and
-  // that refetch actually resolving — where this query's cached data still
-  // lists the OLD case, and the rehydrate effect right below fires on
-  // exactly that stale read, resurrecting the very card that was just
-  // dismissed. See this file's git history for the "End Session button
-  // comes back" bug this originally fixed, back when there was only ever
-  // one case to track.
+  // it's locally dismissed (handleComplete/handleDismiss/a successful
+  // handleConvertToCase), rather than waiting for the mutation's own
+  // invalidateQueries to trigger a refetch. Without this, there's a window
+  // — between clearing local state here and that refetch actually
+  // resolving — where this query's cached data still lists the OLD case,
+  // and the rehydrate effect right below fires on exactly that stale read,
+  // resurrecting the very card that was just dismissed. See this file's git
+  // history for the "End Session button comes back" bug this originally
+  // fixed, back when there was only ever one case to track.
   const clearCachedCase = useCallback(
     (caseId: string): void => {
       queryClient.setQueryData<EngineerPresence | undefined>(ENGINEER_STATUS_QUERY_KEY, (prev) =>
@@ -413,6 +420,49 @@ export default function EngineerAlertNotification(): JSX.Element | null {
     [completeMutation, clearCachedCase],
   );
 
+  // Converts this session into a real case (see useConvertChatToCase's own
+  // doc comment and the project's chat-first-escalation-plan.md).
+  // Deliberately does NOT clear the session locally before the call
+  // resolves, unlike handleComplete: this is a real, error-surfacing call,
+  // not best-effort -- a failure means either nothing happened server-side
+  // (safe to leave the chat exactly as it was and let the engineer retry),
+  // or, in a narrow window, a real case was created but ending the chat
+  // session failed (see HandleConvertToCase's own doc comment on this
+  // backend), which the engineer needs to see and act on manually rather
+  // than have the chat silently vanish out from under them. Only on
+  // success does this clear the session, exactly like a normal "End
+  // Session"/Completed result already does -- any freed-then-backfilled
+  // case from ending this session arrives the same way it always does, as
+  // a plain "customer_escalation" SSE event (see handleAlert above), so
+  // there is nothing extra to wire up here for that.
+  const handleConvertToCase = useCallback(
+    async (session: ActiveSession): Promise<void> => {
+      const { caseId } = session;
+      setConvertErrorByCaseId((current) => {
+        if (!(caseId in current)) return current;
+        const next = { ...current };
+        delete next[caseId];
+        return next;
+      });
+      try {
+        await convertMutation.mutateAsync({ caseId });
+        setCasesByCaseId((current) => {
+          const next = { ...current };
+          delete next[caseId];
+          return next;
+        });
+        clearCachedCase(caseId);
+      } catch (err) {
+        const message =
+          err instanceof BackendApiError && err.message
+            ? err.message
+            : "Failed to create a case for this chat. Please try again.";
+        setConvertErrorByCaseId((current) => ({ ...current, [caseId]: message }));
+      }
+    },
+    [convertMutation, clearCachedCase],
+  );
+
   const handleDraftKeyDown = useCallback(
     (session: ActiveSession) =>
       (e: KeyboardEvent<HTMLDivElement>): void => {
@@ -524,21 +574,41 @@ export default function EngineerAlertNotification(): JSX.Element | null {
       {sessionEntries.map((session) => (
         <Paper key={session.caseId} elevation={4} sx={{ display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <Box sx={{ p: 1.5, borderBottom: 1, borderColor: "divider" }}>
-            <Stack direction="row" alignItems="center" justifyContent="space-between">
+            <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
               <Typography variant="subtitle2" fontWeight={600} noWrap sx={{ pr: 1 }}>
                 {session.customerName || "Live chat"}
               </Typography>
-              <Button
-                size="small"
-                variant="outlined"
-                color="inherit"
-                onClick={() => void handleComplete(session)}
-                disabled={completeMutation.isPending}
-                sx={{ textTransform: "none" }}
-              >
-                End session
-              </Button>
+              <Stack direction="row" spacing={1} flexShrink={0}>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="primary"
+                  onClick={() => void handleConvertToCase(session)}
+                  disabled={convertMutation.isPending || completeMutation.isPending}
+                  startIcon={
+                    convertMutation.isPending ? <CircularProgress size={14} color="inherit" /> : undefined
+                  }
+                  sx={{ textTransform: "none" }}
+                >
+                  Convert to Case
+                </Button>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="inherit"
+                  onClick={() => void handleComplete(session)}
+                  disabled={completeMutation.isPending || convertMutation.isPending}
+                  sx={{ textTransform: "none" }}
+                >
+                  End session
+                </Button>
+              </Stack>
             </Stack>
+            {convertErrorByCaseId[session.caseId] && (
+              <Typography variant="caption" color="error" sx={{ mt: 0.5, display: "block" }}>
+                {convertErrorByCaseId[session.caseId]}
+              </Typography>
+            )}
           </Box>
           <Box
             sx={{
