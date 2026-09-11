@@ -445,3 +445,43 @@ func (c *Client) SetMaxConcurrentChats(ctx context.Context, userID string, max i
 	}{UserID: userID, MaxConcurrentChats: max}
 	return c.do(ctx, http.MethodPatch, "/route/capacity", body, nil)
 }
+
+// GetCaseInfo calls POST /route/workitem/{caseId}/info, returning caseID's
+// originally-submitted CaseInfo (subject, customer email/name, message,
+// projectId) exactly as CreateWorkItem stored it -- see router.Router.
+// GetCaseInfo. Used by csm-portal/backend's HandleConvertToCase (part of
+// the chat-first-escalation flow, see that plan's §6) to build a real
+// entity CreateCaseRequest without the engineer's browser having to resend
+// data this service already has.
+func (c *Client) GetCaseInfo(ctx context.Context, caseID string) (CaseInfo, error) {
+	var out CaseInfo
+	err := c.do(ctx, http.MethodPost, "/route/workitem/"+url.PathEscape(caseID)+"/info", nil, &out)
+	return out, err
+}
+
+// ConvertToCaseResult mirrors router.ConvertToCaseResult.
+type ConvertToCaseResult struct {
+	// AssignedCase is set when converting freed a slot that was immediately
+	// backfilled from the waiting queue -- same shape/meaning as
+	// CompletedResult.AssignedCase, since ConvertToCase ends the session the
+	// same way Completed does (see the chat-first-escalation plan's §5).
+	AssignedCase *CaseInfo `json:"assignedCase,omitempty"`
+}
+
+// ConvertToCase calls POST /route/convert-to-case, ending caseID's chat
+// session and recording entityCaseID against it (state -> CONVERTED_CASE)
+// -- see router.Router.ConvertToCase. userID must be the engineer currently
+// holding caseID in an accepted (ACTIVE) session: anyone else, or a case
+// not yet accepted, gets a 409 from that endpoint (surfaced here as a plain
+// error, same as any other upstream 4xx -- callers needing to distinguish
+// "wrong engineer" from "already converted" should inspect the error text).
+func (c *Client) ConvertToCase(ctx context.Context, userID, caseID, entityCaseID string) (ConvertToCaseResult, error) {
+	var out ConvertToCaseResult
+	body := struct {
+		UserID       string `json:"userId"`
+		CaseID       string `json:"caseId"`
+		EntityCaseID string `json:"entityCaseId"`
+	}{UserID: userID, CaseID: caseID, EntityCaseID: entityCaseID}
+	err := c.do(ctx, http.MethodPost, "/route/convert-to-case", body, &out)
+	return out, err
+}
