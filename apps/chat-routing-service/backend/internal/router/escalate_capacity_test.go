@@ -18,6 +18,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -71,5 +72,55 @@ func TestEscalate_FourRealEscalationsLandOnCapacityFourEngineer(t *testing.T) {
 	}
 	if activeCount != 4 {
 		t.Fatalf("expected exactly 4 active chats actually assigned to the capacity-4 engineer, got %d", activeCount)
+	}
+}
+
+// TestEscalate_ErrorsInsteadOfSilentlyNoOpingWhenConversationRowMissing
+// guards against the exact gap a live manual walkthrough caught (see the
+// project's db-schema-review-2026-09-07-outcomes.md, "Manual capacity
+// walkthrough" section): a caller that reaches Escalate without first
+// creating the case's chat_conversation row (e.g. csm-portal/backend's
+// CreateWorkItem call failed or was skipped) used to get back a
+// success-shaped EscalateResult{EngineerUserID: ...} while
+// assignCaseToEngineer silently updated zero rows -- the case was never
+// actually recorded as assigned to anyone. Escalate must now surface
+// ErrConversationNotFound instead of pretending it worked.
+func TestEscalate_ErrorsInsteadOfSilentlyNoOpingWhenConversationRowMissing(t *testing.T) {
+	r, pool := newTestRouter(t)
+	ctx := context.Background()
+
+	userID := testUserID(t, r, pool, "missing-conversation")
+	if _, err := r.SetPresence(ctx, userID, StatusAvailable); err != nil {
+		t.Fatalf("SetPresence(AVAILABLE): %v", err)
+	}
+
+	// Deliberately skip conversationFixture -- no chat_conversation row
+	// exists for this case, unlike every other test in this package.
+	caseID := testCaseID(t, pool, "missing-conversation-case")
+	ci := CaseInfo{
+		CaseID: caseID, ConversationID: "conv-" + caseID,
+		Subject: "test", CustomerEmail: "router-test@example.com",
+	}
+
+	_, err := r.Escalate(ctx, ci)
+	if err == nil {
+		t.Fatal("expected Escalate to fail when no chat_conversation row exists for the case, got nil error")
+	}
+	if !errors.Is(err, ErrConversationNotFound) {
+		t.Fatalf("expected errors.Is(err, ErrConversationNotFound), got: %v", err)
+	}
+
+	// The whole transaction -- including the chat_queue row Escalate had
+	// inserted before hitting the error -- must have rolled back. Silently
+	// leaving that row behind as ASSIGNED with no real assignee would be
+	// its own, quieter version of the same bug.
+	var queueRowCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM chat_queue WHERE chat_conversation_id = $1
+	`, ci.ConversationID).Scan(&queueRowCount); err != nil {
+		t.Fatalf("count chat_queue rows: %v", err)
+	}
+	if queueRowCount != 0 {
+		t.Fatalf("expected the failed Escalate's chat_queue insert to roll back, found %d row(s)", queueRowCount)
 	}
 }

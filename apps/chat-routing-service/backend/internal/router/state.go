@@ -856,23 +856,45 @@ func popAvailableEngineer(ctx context.Context, tx pgx.Tx, exclude string) (userI
 	}
 }
 
+// ErrConversationNotFound is returned by assignCaseToEngineer (and so by
+// every method that calls it -- Escalate, SetPresence, Completed, Decline,
+// and timeoutOne) when c's chat_conversation row doesn't exist, or is
+// already ended, at assignment time. This is always a genuine bug rather
+// than an expected condition: csm-portal/backend's CreateWorkItem is
+// supposed to create the row before ever calling Escalate (see Escalate's
+// own doc comment), and every other call site either reuses a row it just
+// locked in the same transaction (Decline, timeoutOne) or one that was
+// already required to exist when it entered the queue (SetPresence's and
+// Completed's drain). Previously this was a silent no-op: Escalate still
+// reported a successful assignment even though nothing was actually
+// persisted, which is exactly the gap a real end-to-end walkthrough caught
+// (see the project's db-schema-review-2026-09-07-outcomes.md, "Manual
+// capacity walkthrough" section) -- a request missing customerEmail never
+// created a chat_conversation row, so the follow-on Escalate call "succeeded"
+// while quietly assigning nothing.
+var ErrConversationNotFound = errors.New("chat_conversation row not found for this case")
+
 // assignCaseToEngineer records userID as c's assignee, reserving one unit
 // of their concurrent-chat capacity. Deliberately never touches
 // cs_engineer_status.chat_status -- unlike the old single-case model,
 // taking a case no longer implies anything about an engineer's own manual
 // status (see SetPresence's doc comment); a case counts toward capacity
 // purely by existing as an OPEN/ACTIVE, non-ended chat_conversation row
-// with this assignee_id. A no-op if the row doesn't exist yet -- the LOCAL
-// STAND-IN chat_conversation row for a brand-new case is expected to
-// already exist by the time this runs, since csm-portal/backend now
-// creates it (via CreateWorkItem) before calling Escalate.
+// with this assignee_id. Returns ErrConversationNotFound, instead of
+// silently doing nothing, if the row doesn't exist (or is already ended) --
+// see ErrConversationNotFound's own doc comment for why this must never be
+// a quiet no-op.
 func assignCaseToEngineer(ctx context.Context, tx pgx.Tx, userID string, c CaseInfo) error {
-	if _, err := tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		UPDATE chat_conversation
 		SET assignee_id = $1, accepted_at = NULL, updated_at = now()
 		WHERE case_id = $2 AND session_ended_at IS NULL
-	`, userID, c.CaseID); err != nil {
+	`, userID, c.CaseID)
+	if err != nil {
 		return fmt.Errorf("assign case to engineer: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: case_id=%s", ErrConversationNotFound, c.CaseID)
 	}
 	return nil
 }

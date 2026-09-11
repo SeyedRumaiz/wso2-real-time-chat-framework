@@ -131,6 +131,10 @@ func (h *RoutingHandler) Escalate(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.router.Escalate(r.Context(), req.toCaseInfo())
 	if err != nil {
+		if errors.Is(err, router.ErrConversationNotFound) {
+			writeError(w, http.StatusBadRequest, "No chat_conversation row exists for this case -- create the work item (POST /route/workitem) before escalating.")
+			return
+		}
 		writeStorageError(w, "escalate", err)
 		return
 	}
