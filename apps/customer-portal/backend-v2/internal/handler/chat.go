@@ -19,20 +19,31 @@
 // internal/handler/chat.go for the engineer-facing side and the shared
 // design notes).
 //
-// Case creation lives HERE, not in csm-portal/backend, even though csm-
-// portal owns everything else about a case: entity-service requires a real
-// deploymentId and deployedProductId to create a case (NOT NULL, FK-
-// enforced — see entity-service's cases migration), and only this backend
-// has any basis for resolving those from a project ID alone (a customer in
-// the Novera chat has picked neither). This handler makes a best-effort
-// choice — the project's first deployment (preferring one whose type is
-// primary_production) and that deployment's first deployed product — and
-// fails the escalation with a clear, actionable message if a project has
-// neither, rather than guessing something invalid. There is deliberately no
-// UI form here: escalating from underneath an AI chat reply is meant to be
-// one click, and a project with zero deployments is treated as an edge case
-// to surface honestly (the customer can still use the existing "Create
-// Case" flow, which does prompt for these), not one to silently paper over.
+// Chat-first escalation: HandleEscalate no longer creates a real
+// entity-service case. It only resolves and validates that this project
+// COULD have one created for it later (see below), then hands the chat off
+// using req.ConversationID as its own identity — see that method's own doc
+// comment and the project's chat-first-escalation-plan.md. A real case is
+// created later, exactly once, only if and when the assigned engineer
+// explicitly converts the chat — see HandleCreateCase below, this file's
+// other exported method.
+//
+// Case creation (whenever it does happen) lives HERE, not in csm-portal/
+// backend, even though csm-portal owns everything else about a case:
+// entity-service requires a real deploymentId and deployedProductId to
+// create a case (NOT NULL, FK-enforced — see entity-service's cases
+// migration), and only this backend has any basis for resolving those from
+// a project ID alone (a customer in the Novera chat has picked neither).
+// Both HandleEscalate (as a fail-fast check) and HandleCreateCase (for
+// real) make the same best-effort choice — the project's first deployment
+// (preferring one whose type is primary_production) and that deployment's
+// first deployed product — failing with a clear, actionable message if a
+// project has neither, rather than guessing something invalid. There is
+// deliberately no UI form for any of this: escalating from underneath an AI
+// chat reply is meant to be one click, and a project with zero deployments
+// is treated as an edge case to surface honestly (the customer can still
+// use the existing "Create Case" flow, which does prompt for these), not
+// one to silently paper over.
 package handler
 
 import (
@@ -194,31 +205,28 @@ func (h *ChatEscalationHandler) HandleEscalate(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusConflict, "This project's deployment has no product on file, so a case can't be created automatically. Please use \"Create Case\" instead.")
 		return
 	}
-	deployedProduct := deployedProducts.DeployedProducts[0]
+	// deployment/deployed-product resolution above stops here now -- it is
+	// no longer followed by entity.CreateCase (chat-first escalation, see
+	// this package's own doc comment and the project's
+	// chat-first-escalation-plan.md §2). It stays as a fail-fast UX guard
+	// only: the customer gets an immediate, actionable error now if this
+	// project has nothing to create a case against, rather than the
+	// engineer discovering that only later, mid-conversation, when they
+	// try to convert (see §8 of that plan). The real resolution runs again,
+	// for real, at conversion time (HandleCreateCase below) -- a deployment
+	// ID cached from here could go stale by then.
 
-	created, err := h.entity.CreateCase(r.Context(), entity.CreateCaseRequest{
-		Type:              "case",
-		ProjectID:         projectID,
-		DeploymentID:      deployment.ID,
-		DeployedProductID: deployedProduct.ID,
-		Subject:           escalationDefaultSubject,
-		Description:       message,
-		Severity:          escalationDefaultSeverity,
-		IssueType:         escalationDefaultIssueType,
-		ConversationID:    req.ConversationID,
-	})
-	if err != nil {
-		slog.ErrorContext(r.Context(), "entity CreateCase failed during chat escalation", "userID", user.UserID, "projectID", projectID, "err", summarizeErr(err))
-		mapUpstreamError(w, err, "Failed to escalate to a live engineer.")
-		return
-	}
-
+	// req.ConversationID -- already validated above, already a UUID unique
+	// per chat -- IS this chat's identity from here on; no entity-service
+	// case exists yet. It becomes chat-routing-service's own case_id (see
+	// that service's workitem.go doc comment) via this same push, exactly
+	// as a real case ID used to.
 	customerName := req.CustomerName
 	if customerName == "" {
 		customerName = user.Email
 	}
 	pushPayload, err := json.Marshal(map[string]string{
-		"caseId":         created.Case.ID,
+		"caseId":         req.ConversationID,
 		"conversationId": req.ConversationID,
 		"projectId":      projectID,
 		"subject":        escalationDefaultSubject,
@@ -229,21 +237,144 @@ func (h *ChatEscalationHandler) HandleEscalate(w http.ResponseWriter, r *http.Re
 	if err == nil {
 		pushCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), chatNotifyTimeout)
 		if pushErr := h.csm.Escalate(pushCtx, pushPayload); pushErr != nil {
-			// Best-effort: the case already exists and is visible in the
-			// normal case list/queue either way — a failed live alert just
-			// means no engineer gets pinged in real time for this one
-			// escalation.
-			slog.ErrorContext(r.Context(), "csm-portal escalate push failed", "userID", user.UserID, "caseID", created.Case.ID, "err", pushErr)
+			// Best-effort, same as before -- but note the failure mode
+			// changed shape: previously a failed push here still left a
+			// real case behind (visible in the normal case list/queue
+			// either way); now there is no case at all until conversion,
+			// so a dropped push means this escalation has no record
+			// anywhere until the customer retries. Still best-effort
+			// rather than failing this request: chat-routing-service being
+			// unreachable is exactly the scenario csm-portal/backend's own
+			// HandleEscalate already has a broadcast fallback for (see
+			// that handler's doc comment) -- failing here instead would
+			// bypass that safety net rather than rely on it.
+			slog.ErrorContext(r.Context(), "csm-portal escalate push failed", "userID", user.UserID, "conversationID", req.ConversationID, "err", pushErr)
 		}
 		cancel()
 	} else {
-		slog.ErrorContext(r.Context(), "failed to encode csm-portal escalate push payload", "userID", user.UserID, "caseID", created.Case.ID, "err", err)
+		slog.ErrorContext(r.Context(), "failed to encode csm-portal escalate push payload", "userID", user.UserID, "conversationID", req.ConversationID, "err", err)
 	}
 
 	writeJSONValue(w, http.StatusCreated, map[string]string{
-		"caseId":  created.Case.ID,
+		"caseId":  req.ConversationID,
 		"message": "Escalated to available engineers.",
 	})
+}
+
+// createCaseRequestBody is the body csm-portal/backend sends to
+// POST /internal/chat/create-case -- the same fields chat-routing-
+// service's GetCaseInfo already had stored from the original escalation
+// (see that service's CaseInfo and csm-portal/backend's own
+// createCaseRequestBody, which is where this shape is filled in), so
+// nothing here is resent by an engineer's browser or invented fresh.
+type createCaseRequestBody struct {
+	// CaseID is chat-routing-service's own case identity for this chat --
+	// equal to ConversationID (see HandleEscalate's own doc comment above)
+	// -- included only for logging/traceability on this end, not used to
+	// build the entity.CreateCaseRequest below.
+	CaseID         string `json:"caseId"`
+	ConversationID string `json:"conversationId"`
+	ProjectID      string `json:"projectId"`
+	Subject        string `json:"subject"`
+	CustomerEmail  string `json:"customerEmail"`
+	CustomerName   string `json:"customerName"`
+	Message        string `json:"message"`
+}
+
+// createCaseResponseBody is this handler's response shape.
+type createCaseResponseBody struct {
+	EntityCaseID string `json:"entityCaseId"`
+}
+
+// HandleCreateCase handles POST /internal/chat/create-case -- the other
+// half of the chat-first-escalation flow (see this package's own doc
+// comment and the project's chat-first-escalation-plan.md §6): a case is
+// no longer created eagerly in HandleEscalate above, only here, once, when
+// the assigned engineer explicitly converts the chat. Not browser-facing --
+// registered on the same internal listener as POST /internal/chat-events,
+// gated by the same middleware.InternalToken check (see cmd/server/
+// main.go), called only by csm-portal/backend's HandleConvertToCase. A
+// distinct handler from ChatEventsHandler, though, not a new Type on it:
+// unlike that handler's "always 202, fire-and-forget" contract, this one is
+// genuinely synchronous and must return a real case ID or a real error,
+// since the engineer's own click depends on it -- same "not best-effort"
+// philosophy HandleEscalate's own entity.CreateCase call used to have,
+// just moved to this later trigger.
+//
+// Reuses HandleEscalate's deployment/deployed-product resolution verbatim
+// (pickDeployment, same preference for primary_production, same fallback
+// to the first result) against req.ProjectID -- run for real this time,
+// not just as a fail-fast guard, since a case is actually about to be
+// created against whatever it resolves to.
+func (h *ChatEscalationHandler) HandleCreateCase(w http.ResponseWriter, r *http.Request) {
+	body, ok := readJSONBody(w, r)
+	if !ok {
+		return
+	}
+	var req createCaseRequestBody
+	if err := json.Unmarshal(body, &req); err != nil || req.ProjectID == "" ||
+		req.ConversationID == "" || !uuidRe.MatchString(req.ConversationID) {
+		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+		return
+	}
+
+	subject := req.Subject
+	if subject == "" {
+		subject = escalationDefaultSubject
+	}
+	message := req.Message
+	if message == "" {
+		message = escalationDefaultMessage
+	}
+
+	deployments, err := h.entity.SearchDeployments(r.Context(), entity.SearchDeploymentsRequest{
+		Pagination: entity.Pagination{Limit: escalationSearchLimit},
+		ProjectIDs: []string{req.ProjectID},
+	})
+	if err != nil {
+		slog.ErrorContext(r.Context(), "entity SearchDeployments failed converting chat to case", "caseID", req.CaseID, "projectID", req.ProjectID, "err", summarizeErr(err))
+		mapUpstreamError(w, err, "Failed to create a case for this chat.")
+		return
+	}
+	if len(deployments.Deployments) == 0 {
+		writeError(w, http.StatusConflict, "This project has no deployment on file, so a case can't be created automatically.")
+		return
+	}
+	deployment := pickDeployment(deployments.Deployments)
+
+	deployedProducts, err := h.entity.SearchDeployedProducts(r.Context(), entity.SearchDeployedProductsRequest{
+		Pagination:    entity.Pagination{Limit: escalationSearchLimit},
+		DeploymentIDs: []string{deployment.ID},
+	})
+	if err != nil {
+		slog.ErrorContext(r.Context(), "entity SearchDeployedProducts failed converting chat to case", "caseID", req.CaseID, "projectID", req.ProjectID, "deploymentID", deployment.ID, "err", summarizeErr(err))
+		mapUpstreamError(w, err, "Failed to create a case for this chat.")
+		return
+	}
+	if len(deployedProducts.DeployedProducts) == 0 {
+		writeError(w, http.StatusConflict, "This project's deployment has no product on file, so a case can't be created automatically.")
+		return
+	}
+	deployedProduct := deployedProducts.DeployedProducts[0]
+
+	created, err := h.entity.CreateCase(r.Context(), entity.CreateCaseRequest{
+		Type:              "case",
+		ProjectID:         req.ProjectID,
+		DeploymentID:      deployment.ID,
+		DeployedProductID: deployedProduct.ID,
+		Subject:           subject,
+		Description:       message,
+		Severity:          escalationDefaultSeverity,
+		IssueType:         escalationDefaultIssueType,
+		ConversationID:    req.ConversationID,
+	})
+	if err != nil {
+		slog.ErrorContext(r.Context(), "entity CreateCase failed converting chat to case", "caseID", req.CaseID, "projectID", req.ProjectID, "err", summarizeErr(err))
+		mapUpstreamError(w, err, "Failed to create a case for this chat.")
+		return
+	}
+
+	writeJSONValue(w, http.StatusCreated, createCaseResponseBody{EntityCaseID: created.Case.ID})
 }
 
 // sendMessageRequestBody is the body the customer's browser sends once a
