@@ -114,13 +114,25 @@ func (c *Client) PushEvent(ctx context.Context, payload []byte) error {
 // PatchCase already returns ([]byte, error) elsewhere in this package).
 // Same Config (base URL, shared token) as PushEvent -- this is a second
 // endpoint on the same backend-v2 internal listener, not a new client.
-func (c *Client) CreateCase(ctx context.Context, payload []byte) ([]byte, error) {
+// userIDToken is the engineer's own x-user-id-token (see
+// HandleConvertToCase's doc comment) -- forwarded as a header so backend-v2
+// can attach it to its own entity-service CreateCase call, which requires
+// it and otherwise has no end-user session to draw one from on this
+// service-to-service route.
+func (c *Client) CreateCase(ctx context.Context, payload []byte, userIDToken string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/internal/chat/create-case", bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("chatnotify: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(internalTokenHeader, c.token)
+	// Forwarded on to entity-service by backend-v2's HandleCreateCase (see
+	// that handler's doc comment) -- entity-service's CreateCase requires
+	// this header, and this internal route has no end-user session of its
+	// own to derive one from otherwise.
+	if userIDToken != "" {
+		req.Header.Set("x-user-id-token", userIDToken)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

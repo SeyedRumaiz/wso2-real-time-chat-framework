@@ -77,6 +77,7 @@ import (
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/apps/chat-routing-service/sdk-go/routingclient"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/entity"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/stream"
 )
@@ -135,7 +136,14 @@ type chatEventPusher interface {
 	// back on the same request. Same *chatnotify.Client satisfies both
 	// methods (same base URL/token) -- this is a second endpoint on that
 	// client, not a second dependency to wire up.
-	CreateCase(ctx context.Context, payload []byte) ([]byte, error)
+	//
+	// userIDToken is forwarded as an x-user-id-token header on the request
+	// to backend-v2 -- this internal, InternalToken-gated route has no
+	// end-user session of its own, so backend-v2 can't otherwise attach one
+	// before calling entity-service's CreateCase (which requires it; see
+	// HandleConvertToCase's own doc comment for why the engineer's token is
+	// used here rather than the original customer's).
+	CreateCase(ctx context.Context, payload []byte, userIDToken string) ([]byte, error)
 }
 
 // routingService abstracts internal/routingclient.Client so tests can fake
@@ -985,7 +993,16 @@ func (h *ChatHandler) HandleConvertToCase(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	respBody, err := h.notify.CreateCase(r.Context(), createPayload)
+	// entity-service's CreateCase requires an x-user-id-token identifying
+	// who the case is created as. This request has no customer session to
+	// draw one from -- it's an engineer-initiated action reaching backend-v2
+	// over a service-to-service, InternalToken-gated hop -- so we forward
+	// the engineer's own token instead (already on this very request, per
+	// internal/middleware/auth.go). For now this attributes the resulting
+	// case to the engineer rather than the original customer; revisit if
+	// that attribution ever needs to change.
+	engineerToken := entity.UserIDTokenFromContext(r.Context())
+	respBody, err := h.notify.CreateCase(r.Context(), createPayload, engineerToken)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "chat: backend-v2 create-case failed converting to case", "userID", user.UserID, "caseID", caseID, "err", err)
 		writeError(w, http.StatusBadGateway, "Failed to create a case for this chat. Please try again.")

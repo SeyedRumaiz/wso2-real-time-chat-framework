@@ -318,6 +318,20 @@ func (h *ChatEscalationHandler) HandleCreateCase(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// This route sits only behind middleware.InternalToken (see
+	// cmd/server/main.go) -- it's a service-to-service call from
+	// csm-portal/backend, not a browser request, so it carries no customer
+	// session of its own for entity.WithUserIDToken to have already been
+	// populated from. entity-service's CreateCase requires that header, so
+	// csm-portal/backend forwards the engineer's own x-user-id-token here
+	// instead (see that service's HandleConvertToCase) -- for now the
+	// resulting case is attributed to the converting engineer rather than
+	// the original customer.
+	ctx := r.Context()
+	if token := r.Header.Get("x-user-id-token"); token != "" {
+		ctx = entity.WithUserIDToken(ctx, token)
+	}
+
 	subject := req.Subject
 	if subject == "" {
 		subject = escalationDefaultSubject
@@ -327,7 +341,7 @@ func (h *ChatEscalationHandler) HandleCreateCase(w http.ResponseWriter, r *http.
 		message = escalationDefaultMessage
 	}
 
-	deployments, err := h.entity.SearchDeployments(r.Context(), entity.SearchDeploymentsRequest{
+	deployments, err := h.entity.SearchDeployments(ctx, entity.SearchDeploymentsRequest{
 		Pagination: entity.Pagination{Limit: escalationSearchLimit},
 		ProjectIDs: []string{req.ProjectID},
 	})
@@ -342,7 +356,7 @@ func (h *ChatEscalationHandler) HandleCreateCase(w http.ResponseWriter, r *http.
 	}
 	deployment := pickDeployment(deployments.Deployments)
 
-	deployedProducts, err := h.entity.SearchDeployedProducts(r.Context(), entity.SearchDeployedProductsRequest{
+	deployedProducts, err := h.entity.SearchDeployedProducts(ctx, entity.SearchDeployedProductsRequest{
 		Pagination:    entity.Pagination{Limit: escalationSearchLimit},
 		DeploymentIDs: []string{deployment.ID},
 	})
@@ -357,7 +371,7 @@ func (h *ChatEscalationHandler) HandleCreateCase(w http.ResponseWriter, r *http.
 	}
 	deployedProduct := deployedProducts.DeployedProducts[0]
 
-	created, err := h.entity.CreateCase(r.Context(), entity.CreateCaseRequest{
+	created, err := h.entity.CreateCase(ctx, entity.CreateCaseRequest{
 		Type:              "case",
 		ProjectID:         req.ProjectID,
 		DeploymentID:      deployment.ID,
