@@ -748,16 +748,9 @@ export default function NoveraChatPage(): JSX.Element {
           ]);
           break;
         }
-        // Sent by backend-v2's ChatEventsHandler when the assigned engineer
-        // converts this chat into a real case (see csm-portal/backend's
-        // HandleConvertToCase and the chat-first-escalation plan's §7) --
-        // deliberately shaped like engineer_disconnected above (same state
-        // resets) since a converted chat ends its live session exactly like
-        // a normal disconnect does, just for a different reason the
-        // customer needs to know about rather than a plain drop. No case
-        // link for now (see event.entityCaseId if that's ever added) --
-        // just telling the customer what happened and that they're back
-        // with the AI assistant.
+        // Sent when the assigned engineer converts this chat into a case.
+        // Mirrors engineer_disconnected's state resets since the live
+        // session ends the same way, just for a different reason.
         case "converted_to_case": {
           setIsHumanConnected(false);
           setAssignedEngineerName(null);

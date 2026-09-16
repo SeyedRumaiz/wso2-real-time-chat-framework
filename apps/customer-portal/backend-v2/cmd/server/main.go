@@ -444,15 +444,10 @@ func main() {
 	// since wsSrv's shared handler chain (built further down) applies to
 	// every route on wsMux uniformly and GET /ws must stay un-gated by it.
 	wsMux.Handle("POST /internal/chat-events", middleware.InternalToken(internalChatToken)(http.HandlerFunc(chatEventsHandler.Handle)))
-	// POST /internal/chat/create-case is the other half of chat-first
-	// escalation (see internal/handler/chat.go's HandleCreateCase and the
-	// project's chat-first-escalation-plan.md §6) -- csm-portal/backend
-	// calls this synchronously when an engineer converts a chat into a real
-	// case. Same listener and same middleware.InternalToken gate as
-	// /internal/chat-events for the same reason (no customer
-	// x-jwt-assertion to present), but a distinct handler: unlike that
-	// route's "always 202" contract, this one returns a real case ID or a
-	// real error.
+	// POST /internal/chat/create-case: csm-portal/backend calls this
+	// synchronously when an engineer converts a chat into a real case.
+	// Same listener/gate as /internal/chat-events, but returns a real case
+	// ID or error rather than always 202.
 	wsMux.Handle("POST /internal/chat/create-case", middleware.InternalToken(internalChatToken)(http.HandlerFunc(chatEscalationHandler.HandleCreateCase)))
 
 	wsAddr := ":" + mustPort("WS_PORT", "8081")

@@ -318,23 +318,16 @@ func (r *Router) Completed(ctx context.Context, userID, caseID string) (Complete
 	return result, nil
 }
 
-// ErrNotConversationOwner is returned by ConvertToCase when caseID exists
-// but isn't currently an ACTIVE conversation held by userID -- covers both
-// "some other engineer holds this" and "this engineer holds it but hasn't
-// accepted yet" without leaking which, since neither is this caller's to
-// convert either way.
+// ErrNotConversationOwner is returned by ConvertToCase when caseID isn't
+// currently an ACTIVE conversation held by userID.
 var ErrNotConversationOwner = errors.New("case is not an active conversation held by this engineer")
 
 // ErrAlreadyConverted is returned by ConvertToCase when caseID has already
-// been converted to a case (or otherwise already ended) -- distinguishes a
-// genuine double-conversion/retry from ErrNotConversationOwner and
-// ErrConversationNotFound so a caller can tell them apart.
+// been converted to a case or otherwise ended.
 var ErrAlreadyConverted = errors.New("chat_conversation is already converted to a case or otherwise ended")
 
-// ConvertToCaseResult mirrors CompletedResult's shape -- converting a chat
-// ends its session exactly like Completed does (see the package doc
-// comment on why this doesn't leave the chat open), so it can free and
-// backfill a capacity slot the same way.
+// ConvertToCaseResult mirrors CompletedResult -- converting a chat ends its
+// session like Completed does, so it can backfill a freed capacity slot.
 type ConvertToCaseResult struct {
 	AssignedCase *CaseInfo `json:"assignedCase,omitempty"`
 }
@@ -373,19 +366,10 @@ func diagnoseConvertFailure(ctx context.Context, tx pgx.Tx, caseID, userID strin
 }
 
 // ConvertToCase ends userID's session on caseID by converting it into a
-// real case (entityCaseID, already created by the caller -- see
-// csm-portal/backend's HandleConvertToCase, which resolves the deployment/
-// deployed-product and calls entity-service's CreateCase before this is
-// ever invoked) rather than a normal Completed call. Only the engineer
-// currently holding caseID can convert it, and only once they've actually
-// accepted it (state ACTIVE) -- converting something not yet opened isn't
-// meaningful.
-//
-// Deliberately does not allow the chat to continue after conversion (see
-// the package doc comment and this feature's chat-first-escalation-plan.md,
-// "resolved: conversion ends the chat" -- the team decided against running
-// the live chat and the new case side by side): sets session_ended_at
-// exactly like Completed does, and backfills the freed slot the same way.
+// real case (entityCaseID, already created by the caller). Only the
+// engineer currently holding an accepted (ACTIVE) caseID can convert it.
+// The chat does not continue after conversion -- it sets session_ended_at
+// and backfills the freed slot exactly like Completed does.
 func (r *Router) ConvertToCase(ctx context.Context, userID, caseID, entityCaseID string) (ConvertToCaseResult, error) {
 	var result ConvertToCaseResult
 	err := r.withTx(ctx, func(tx pgx.Tx) error {

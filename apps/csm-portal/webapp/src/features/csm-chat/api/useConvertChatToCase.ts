@@ -32,33 +32,11 @@ export interface ConvertChatToCaseResult {
 
 /**
  * Converts a live-engineer-chat session into a real case: POST
- * /chat/sessions/{caseId}/convert-to-case (see csm-portal/backend's
- * internal/handler/chat.go HandleConvertToCase and the project's
- * chat-first-escalation-plan.md). No request body — chat-routing-service
- * already has everything this call needs (subject, customer, message,
- * projectId), stored from the original escalation, so the browser never
- * resends it.
- *
- * Engineer-initiated only (see EngineerAlertNotification's "Convert to
- * Case" button, shown only on an already-accepted session) — the customer
- * never sees this control themselves once a human is on the chat.
- *
- * Unlike useCompleteChatSession, a rejection here is surfaced to the caller,
- * not best-effort: this is a real, synchronous case-creation call (mirrors
- * HandleEscalate's own historical "not best-effort" CreateCase call, just
- * moved to this later trigger) — a failure means either nothing happened
- * (safe to retry) or, in a narrow window, a real case was created but
- * ending the chat session failed server-side, which the engineer needs to
- * know about rather than have silently swallowed. Either way, the caller
- * (EngineerAlertNotification.handleConvertToCase) deliberately does NOT
- * clear the session locally on failure — see that function's own comment.
- *
- * On success, this chat has ended exactly like Completed ends one (see
- * router.Router.ConvertToCase) — same capacity/queue-backfill side effects,
- * delivered the same way (a "customer_escalation" SSE event straight to
- * this engineer if a freed slot was immediately backfilled, no different
- * handling needed here) — so this invalidates the status query the same
- * way useCompleteChatSession/useDeclineChatSession/useSetEngineerStatus do.
+ * /chat/sessions/{caseId}/convert-to-case, no request body needed since
+ * chat-routing-service already has the original escalation's details.
+ * Unlike useCompleteChatSession, a rejection is surfaced to the caller
+ * rather than swallowed, since a failure may mean a case was created but
+ * ending the chat session failed server-side.
  */
 export function useConvertChatToCase(): UseMutationResult<
   ConvertChatToCaseResult,

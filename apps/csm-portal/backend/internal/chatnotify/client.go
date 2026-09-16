@@ -104,21 +104,10 @@ func (c *Client) PushEvent(ctx context.Context, payload []byte) error {
 }
 
 // CreateCase POSTs payload to backend-v2's POST /internal/chat/create-case
-// and returns the raw JSON response body on success (expected shape:
-// {"entityCaseId": "..."}) . Unlike PushEvent, this is NOT best-effort --
-// see internal/handler/chat.go's HandleConvertToCase, the only caller:
-// converting a chat into a real entity-service case needs a genuine
-// synchronous result (the new case's ID) back on the same request, not a
-// fire-and-forget notification, so the response body is returned to the
-// caller instead of being discarded (mirrors how entityChatClient.
-// PatchCase already returns ([]byte, error) elsewhere in this package).
-// Same Config (base URL, shared token) as PushEvent -- this is a second
-// endpoint on the same backend-v2 internal listener, not a new client.
-// userIDToken is the engineer's own x-user-id-token (see
-// HandleConvertToCase's doc comment) -- forwarded as a header so backend-v2
-// can attach it to its own entity-service CreateCase call, which requires
-// it and otherwise has no end-user session to draw one from on this
-// service-to-service route.
+// and returns the raw response body. Unlike PushEvent, this is NOT
+// best-effort -- the caller needs the new case's ID back synchronously.
+// userIDToken is forwarded as an x-user-id-token header since backend-v2
+// has no end-user session to derive one from on this internal route.
 func (c *Client) CreateCase(ctx context.Context, payload []byte, userIDToken string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/internal/chat/create-case", bytes.NewReader(payload))
 	if err != nil {

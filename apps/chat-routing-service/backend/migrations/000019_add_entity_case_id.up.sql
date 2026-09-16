@@ -14,16 +14,8 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Supports converting a chat into a real entity-service case
--- (Router.ConvertToCase), per the chat-first escalation plan: a chat starts
--- with only chat-routing-service's own LOCAL STAND-IN identity (case_id,
--- already just an opaque TEXT key -- see workitem.go), and a real
--- entity-service case is only ever created later, explicitly, by the
--- assigned engineer. entity_case_id records that real case's ID once (and
--- only if) that happens.
---
--- No FK: entity-service's cases table lives in a different service's data
--- model entirely, so this is a plain reference, not a database-enforced
--- one. NULL for the entire life of a chat that never converts.
+-- Records the real entity-service case ID once a chat is converted into
+-- one (Router.ConvertToCase). No FK, since that table lives in a different
+-- service's data model. NULL for the life of a chat that never converts.
 ALTER TABLE chat_routing.chat_conversation
   ADD COLUMN entity_case_id TEXT NULL;

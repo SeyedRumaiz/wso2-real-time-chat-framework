@@ -144,12 +144,10 @@ func pickDeployment(deployments []entity.DeploymentView) entity.DeploymentView {
 }
 
 // HandleEscalate handles POST /projects/{id}/support/chat/escalate.
-// Resolves a deployment/deployed-product for the project (see the package
-// doc comment), creates the case directly against entity-service, then
-// best-effort notifies csm-portal/backend so a connected engineer sees the
-// alert. The case creation itself is NOT best-effort: if it fails, the
-// whole request fails, since there is nothing meaningful to notify anyone
-// about without a case.
+// Resolves a deployment/deployed-product for the project as a fail-fast
+// check, then best-effort notifies csm-portal/backend so a connected
+// engineer sees the alert. No entity-service case is created here -- one
+// is only created later, if the engineer converts the chat (HandleCreateCase).
 func (h *ChatEscalationHandler) HandleEscalate(w http.ResponseWriter, r *http.Request) {
 	user := middleware.UserInfoFromContext(r.Context())
 	if user == nil {
@@ -205,22 +203,12 @@ func (h *ChatEscalationHandler) HandleEscalate(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusConflict, "This project's deployment has no product on file, so a case can't be created automatically. Please use \"Create Case\" instead.")
 		return
 	}
-	// deployment/deployed-product resolution above stops here now -- it is
-	// no longer followed by entity.CreateCase (chat-first escalation, see
-	// this package's own doc comment and the project's
-	// chat-first-escalation-plan.md §2). It stays as a fail-fast UX guard
-	// only: the customer gets an immediate, actionable error now if this
-	// project has nothing to create a case against, rather than the
-	// engineer discovering that only later, mid-conversation, when they
-	// try to convert (see §8 of that plan). The real resolution runs again,
-	// for real, at conversion time (HandleCreateCase below) -- a deployment
-	// ID cached from here could go stale by then.
+	// This is a fail-fast UX guard only -- no case is created from it. The
+	// resolution runs again for real at conversion time (HandleCreateCase
+	// below), since a deployment cached from here could go stale by then.
 
-	// req.ConversationID -- already validated above, already a UUID unique
-	// per chat -- IS this chat's identity from here on; no entity-service
-	// case exists yet. It becomes chat-routing-service's own case_id (see
-	// that service's workitem.go doc comment) via this same push, exactly
-	// as a real case ID used to.
+	// req.ConversationID becomes chat-routing-service's own case_id via
+	// this push -- no entity-service case exists yet.
 	customerName := req.CustomerName
 	if customerName == "" {
 		customerName = user.Email
@@ -237,17 +225,10 @@ func (h *ChatEscalationHandler) HandleEscalate(w http.ResponseWriter, r *http.Re
 	if err == nil {
 		pushCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), chatNotifyTimeout)
 		if pushErr := h.csm.Escalate(pushCtx, pushPayload); pushErr != nil {
-			// Best-effort, same as before -- but note the failure mode
-			// changed shape: previously a failed push here still left a
-			// real case behind (visible in the normal case list/queue
-			// either way); now there is no case at all until conversion,
-			// so a dropped push means this escalation has no record
-			// anywhere until the customer retries. Still best-effort
-			// rather than failing this request: chat-routing-service being
-			// unreachable is exactly the scenario csm-portal/backend's own
-			// HandleEscalate already has a broadcast fallback for (see
-			// that handler's doc comment) -- failing here instead would
-			// bypass that safety net rather than rely on it.
+			// Best-effort: a dropped push means this escalation has no
+			// record anywhere until the customer retries, but failing the
+			// request here would bypass csm-portal/backend's own broadcast
+			// fallback for an unreachable chat-routing-service.
 			slog.ErrorContext(r.Context(), "csm-portal escalate push failed", "userID", user.UserID, "conversationID", req.ConversationID, "err", pushErr)
 		}
 		cancel()
@@ -262,16 +243,11 @@ func (h *ChatEscalationHandler) HandleEscalate(w http.ResponseWriter, r *http.Re
 }
 
 // createCaseRequestBody is the body csm-portal/backend sends to
-// POST /internal/chat/create-case -- the same fields chat-routing-
-// service's GetCaseInfo already had stored from the original escalation
-// (see that service's CaseInfo and csm-portal/backend's own
-// createCaseRequestBody, which is where this shape is filled in), so
-// nothing here is resent by an engineer's browser or invented fresh.
+// POST /internal/chat/create-case: the chat's original escalation details,
+// so nothing here is resent by an engineer's browser or invented fresh.
 type createCaseRequestBody struct {
-	// CaseID is chat-routing-service's own case identity for this chat --
-	// equal to ConversationID (see HandleEscalate's own doc comment above)
-	// -- included only for logging/traceability on this end, not used to
-	// build the entity.CreateCaseRequest below.
+	// CaseID is chat-routing-service's own case identity for this chat
+	// (equal to ConversationID), included only for logging on this end.
 	CaseID         string `json:"caseId"`
 	ConversationID string `json:"conversationId"`
 	ProjectID      string `json:"projectId"`
@@ -286,26 +262,12 @@ type createCaseResponseBody struct {
 	EntityCaseID string `json:"entityCaseId"`
 }
 
-// HandleCreateCase handles POST /internal/chat/create-case -- the other
-// half of the chat-first-escalation flow (see this package's own doc
-// comment and the project's chat-first-escalation-plan.md §6): a case is
-// no longer created eagerly in HandleEscalate above, only here, once, when
-// the assigned engineer explicitly converts the chat. Not browser-facing --
-// registered on the same internal listener as POST /internal/chat-events,
-// gated by the same middleware.InternalToken check (see cmd/server/
-// main.go), called only by csm-portal/backend's HandleConvertToCase. A
-// distinct handler from ChatEventsHandler, though, not a new Type on it:
-// unlike that handler's "always 202, fire-and-forget" contract, this one is
-// genuinely synchronous and must return a real case ID or a real error,
-// since the engineer's own click depends on it -- same "not best-effort"
-// philosophy HandleEscalate's own entity.CreateCase call used to have,
-// just moved to this later trigger.
-//
-// Reuses HandleEscalate's deployment/deployed-product resolution verbatim
-// (pickDeployment, same preference for primary_production, same fallback
-// to the first result) against req.ProjectID -- run for real this time,
-// not just as a fail-fast guard, since a case is actually about to be
-// created against whatever it resolves to.
+// HandleCreateCase handles POST /internal/chat/create-case: creates a real
+// entity-service case for a chat, called only when the assigned engineer
+// explicitly converts it. Internal and synchronous (unlike
+// ChatEventsHandler's fire-and-forget events) since the caller needs a
+// real case ID or error back. Reuses HandleEscalate's deployment/
+// deployed-product resolution, run for real this time against req.ProjectID.
 func (h *ChatEscalationHandler) HandleCreateCase(w http.ResponseWriter, r *http.Request) {
 	body, ok := readJSONBody(w, r)
 	if !ok {
@@ -318,15 +280,10 @@ func (h *ChatEscalationHandler) HandleCreateCase(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// This route sits only behind middleware.InternalToken (see
-	// cmd/server/main.go) -- it's a service-to-service call from
-	// csm-portal/backend, not a browser request, so it carries no customer
-	// session of its own for entity.WithUserIDToken to have already been
-	// populated from. entity-service's CreateCase requires that header, so
-	// csm-portal/backend forwards the engineer's own x-user-id-token here
-	// instead (see that service's HandleConvertToCase) -- for now the
-	// resulting case is attributed to the converting engineer rather than
-	// the original customer.
+	// This route has no browser session of its own, so it reads the
+	// engineer's x-user-id-token (forwarded by csm-portal/backend) off the
+	// request header instead; the resulting case is attributed to the
+	// converting engineer, not the original customer.
 	ctx := r.Context()
 	if token := r.Header.Get("x-user-id-token"); token != "" {
 		ctx = entity.WithUserIDToken(ctx, token)

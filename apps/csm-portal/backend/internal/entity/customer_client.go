@@ -51,14 +51,7 @@ func userIDTokenFromContext(ctx context.Context) string {
 }
 
 // UserIDTokenFromContext returns the x-user-id-token value stashed on ctx by
-// WithUserIDToken (in this handler's case, internal/middleware/auth.go, from
-// the authenticated engineer's own request), or "" if none was set. Exported
-// for HandleConvertToCase (internal/handler/chat.go), which needs to forward
-// the engineer's own token across the service-to-service hop to
-// customer-portal/backend-v2's POST /internal/chat/create-case -- that
-// internal, InternalToken-gated route has no end-user session of its own to
-// derive one from otherwise. See that handler's doc comment for why the
-// engineer's token is used here rather than the original customer's.
+// WithUserIDToken, or "" if none was set.
 func UserIDTokenFromContext(ctx context.Context) string {
 	return userIDTokenFromContext(ctx)
 }

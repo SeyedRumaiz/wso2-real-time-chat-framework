@@ -102,10 +102,8 @@ export default function EngineerAlertNotification(): JSX.Element | null {
   const myEmail = useIdTokenClaims()?.email;
   const [casesByCaseId, setCasesByCaseId] = useState<Record<string, CaseEntry>>({});
   const [draftByCaseId, setDraftByCaseId] = useState<Record<string, string>>({});
-  // Per-case error text for a failed "Convert to Case" attempt -- see
-  // handleConvertToCase's own comment on why that failure is surfaced
-  // inline instead of silently clearing the session like handleComplete
-  // does.
+  // Per-case error text for a failed "Convert to Case" attempt, shown
+  // inline instead of silently clearing the session.
   const [convertErrorByCaseId, setConvertErrorByCaseId] = useState<Record<string, string>>({});
 
   const acceptMutation = useAcceptChatSession();
@@ -143,16 +141,9 @@ export default function EngineerAlertNotification(): JSX.Element | null {
     [now, pendingTimeoutSeconds],
   );
 
-  // Removes one case from the cached presence's `cases` array the instant
-  // it's locally dismissed (handleComplete/handleDismiss/a successful
-  // handleConvertToCase), rather than waiting for the mutation's own
-  // invalidateQueries to trigger a refetch. Without this, there's a window
-  // — between clearing local state here and that refetch actually
-  // resolving — where this query's cached data still lists the OLD case,
-  // and the rehydrate effect right below fires on exactly that stale read,
-  // resurrecting the very card that was just dismissed. See this file's git
-  // history for the "End Session button comes back" bug this originally
-  // fixed, back when there was only ever one case to track.
+  // Removes one case from the cached presence's `cases` array immediately,
+  // rather than waiting for the mutation's own invalidateQueries: without
+  // this, a stale refetch can resurrect a card that was just dismissed.
   const clearCachedCase = useCallback(
     (caseId: string): void => {
       queryClient.setQueryData<EngineerPresence | undefined>(ENGINEER_STATUS_QUERY_KEY, (prev) =>
@@ -420,21 +411,10 @@ export default function EngineerAlertNotification(): JSX.Element | null {
     [completeMutation, clearCachedCase],
   );
 
-  // Converts this session into a real case (see useConvertChatToCase's own
-  // doc comment and the project's chat-first-escalation-plan.md).
-  // Deliberately does NOT clear the session locally before the call
-  // resolves, unlike handleComplete: this is a real, error-surfacing call,
-  // not best-effort -- a failure means either nothing happened server-side
-  // (safe to leave the chat exactly as it was and let the engineer retry),
-  // or, in a narrow window, a real case was created but ending the chat
-  // session failed (see HandleConvertToCase's own doc comment on this
-  // backend), which the engineer needs to see and act on manually rather
-  // than have the chat silently vanish out from under them. Only on
-  // success does this clear the session, exactly like a normal "End
-  // Session"/Completed result already does -- any freed-then-backfilled
-  // case from ending this session arrives the same way it always does, as
-  // a plain "customer_escalation" SSE event (see handleAlert above), so
-  // there is nothing extra to wire up here for that.
+  // Converts this session into a real case. Unlike handleComplete, this
+  // does NOT clear the session locally until the call succeeds, since a
+  // failure may mean a case was created but ending the chat failed
+  // server-side -- the engineer needs to see and act on that manually.
   const handleConvertToCase = useCallback(
     async (session: ActiveSession): Promise<void> => {
       const { caseId } = session;

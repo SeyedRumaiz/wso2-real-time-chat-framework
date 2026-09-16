@@ -455,13 +455,9 @@ func caseInfoToResponse(c router.CaseInfo) caseInfoResponse {
 	}
 }
 
-// GetCaseInfo handles POST /route/workitem/{caseId}/info -- see
-// router.Router.GetCaseInfo's own doc comment. Called by csm-portal/
-// backend's HandleConvertToCase to fetch the subject/customer/message data
-// needed to build a real entity CreateCaseRequest, without the engineer's
-// browser having to resend anything this service already has. POST rather
-// than GET only because it lives under the same server-to-server-only
-// surface as the rest of this package's mutating routes; it has no body.
+// GetCaseInfo handles POST /route/workitem/{caseId}/info, returning the
+// case's originally-submitted subject/customer/message data. POST rather
+// than GET only to match this package's other server-to-server routes.
 func (h *RoutingHandler) GetCaseInfo(w http.ResponseWriter, r *http.Request) {
 	caseID := r.PathValue("caseId")
 	if caseID == "" {
@@ -481,9 +477,8 @@ func (h *RoutingHandler) GetCaseInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // convertToCaseRequest is the body for POST /route/convert-to-case.
-// EntityCaseID is the real entity-service case ID csm-portal/backend
-// already obtained from backend-v2's POST /internal/chat/create-case,
-// before calling this -- see the chat-first-escalation plan's §6.
+// EntityCaseID is the real entity-service case ID the caller already
+// created before calling this endpoint.
 type convertToCaseRequest struct {
 	UserID       string `json:"userId"`
 	CaseID       string `json:"caseId"`
@@ -498,11 +493,8 @@ type convertToCaseResponse struct {
 }
 
 // ConvertToCase handles POST /route/convert-to-case -- ends caseId's chat
-// session and records entityCaseId against it (state -> CONVERTED_CASE),
-// per router.Router.ConvertToCase. userId must be the engineer currently
-// holding caseId in an accepted (ACTIVE) session; anyone else, or a case
-// that isn't yet accepted, is rejected the same way (ErrNotConversationOwner)
-// since from this engineer's perspective neither case is theirs to convert.
+// session and records entityCaseId against it. userId must be the engineer
+// currently holding caseId in an accepted (ACTIVE) session.
 func (h *RoutingHandler) ConvertToCase(w http.ResponseWriter, r *http.Request) {
 	var req convertToCaseRequest
 	if !decodeBody(w, r, &req) {
