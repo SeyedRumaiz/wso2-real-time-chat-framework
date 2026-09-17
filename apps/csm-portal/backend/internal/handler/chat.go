@@ -39,9 +39,12 @@
 //   - Which case a browser message belongs to travels as an explicit
 //     conversationId/caseId pair on every request — this handler keeps no
 //     server-side session table mapping one to the other. customer-portal's
-//     escalate call already knows both (it just created the case), and
-//     every subsequent engineer-side call carries the conversationId the
-//     original SSE alert included.
+//     escalate call already knows both: no entity-service case exists yet
+//     under chat-first escalation, so it sends its own conversationId as
+//     caseId too (the two stay equal until conversion — see
+//     HandleConvertToCase and backend-v2's own escalation handler). Every
+//     subsequent engineer-side call carries the conversationId the original
+//     SSE alert included.
 //   - Engineer presence for "is anyone connected at all" still has no
 //     heartbeat/presence table — that's still derived from who has
 //     GET /chat/alerts/stream open (see chat_stream.go). What an engineer's
@@ -321,10 +324,11 @@ func assignedCaseEvent(ci routingclient.CaseInfo) chatEvent {
 
 // escalateRequest is the body customer-portal/backend-v2 sends to
 // POST /internal/chat/escalate. CustomerName is a display label only — it is
-// never used for authorization or attribution in a durable record (the case
-// itself already records its own createdBy from the CreateCase call
-// backend-v2 made against entity-service directly), only shown in the
-// engineer's alert UI.
+// never used for authorization or attribution in a durable record. No
+// entity-service case exists yet at this point (chat-first escalation
+// defers case creation until the engineer converts, see
+// HandleConvertToCase) -- CustomerName is shown only in the engineer's
+// alert UI.
 type escalateRequest struct {
 	CaseID         string `json:"caseId"`
 	ConversationID string `json:"conversationId"`
@@ -337,13 +341,16 @@ type escalateRequest struct {
 
 // HandleEscalate handles POST /internal/chat/escalate. Not browser-facing —
 // registered only on the internal listener behind middleware.InternalToken
-// (see cmd/server/main.go), called exclusively by customer-portal/backend-v2
-// once it has already created the case against entity-service directly
-// (backend-v2 owns case creation for this flow because only it has the
-// deployment/deployed-product context a case requires — see that backend's
-// own escalation handler's doc comment). This handler's only job is to ask
-// the routing service which engineer (if any) should get this case, and
-// deliver it accordingly; it does not call entity-service at all.
+// (see cmd/server/main.go), called by customer-portal/backend-v2's own
+// HandleEscalate before any entity-service case exists -- chat-first
+// escalation defers real case creation until the assigned engineer
+// explicitly converts the chat (see HandleConvertToCase below and
+// backend-v2's escalation handler's own doc comment). req.CaseID here is
+// chat-routing-service's own provisional case identity (equal to
+// conversationId), not a real entity-service case ID. This handler's only
+// job is to ask the routing service which engineer (if any) should get
+// this case, and deliver it accordingly; it does not call entity-service
+// at all.
 func (h *ChatHandler) HandleEscalate(w http.ResponseWriter, r *http.Request) {
 	body, ok := readChatBody(w, r)
 	if !ok {
